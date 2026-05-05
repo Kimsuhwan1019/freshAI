@@ -1,9 +1,13 @@
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
+import 'package:intl/intl.dart';
 import '../../services/openai_service.dart';
 import '../../services/ingredient_service.dart';
+import '../../utils/expiry_utils.dart';
 import '../ingredients/ingredient_form_screen.dart';
+
+enum _ScanMode { fridge, receipt }
 
 class CameraScreen extends StatefulWidget {
   const CameraScreen({super.key});
@@ -23,11 +27,24 @@ class _CameraScreenState extends State<CameraScreen> {
   bool _isAnalyzing = false;
   bool _isSaving = false;
 
-  @override
-  void initState() {
-    super.initState();
-    _openAI.loadApiKey();
+  _ScanMode _mode = _ScanMode.fridge;
+  DateTime _purchaseDate = DateTime.now();
+
+  bool get _isReceiptMode => _mode == _ScanMode.receipt;
+
+  // ── Mode switch ────────────────────────────────────────────
+
+  void _switchMode(_ScanMode mode) {
+    if (_mode == mode) return;
+    setState(() {
+      _mode = mode;
+      _image = null;
+      _recognized = null;
+      _selected = [];
+    });
   }
+
+  // ── Image picking ──────────────────────────────────────────
 
   Future<void> _pick(ImageSource source) async {
     try {
@@ -50,13 +67,20 @@ class _CameraScreenState extends State<CameraScreen> {
     }
   }
 
+  // ── Analysis dispatch ──────────────────────────────────────
+
   Future<void> _analyze() async {
     if (_image == null) return;
-
     setState(() => _isAnalyzing = true);
     try {
       final bytes = await _image!.readAsBytes();
-      final result = await _openAI.recognizeIngredients(bytes);
+      final result = _isReceiptMode
+          ? await _openAI.extractReceiptIngredients(
+              bytes,
+              purchaseDate: _purchaseDate,
+            )
+          : await _openAI.recognizeIngredients(bytes);
+
       setState(() {
         _recognized = result;
         _selected = List.filled(result.length, true);
@@ -68,12 +92,34 @@ class _CameraScreenState extends State<CameraScreen> {
     }
   }
 
+  // ── Purchase date change → recalculate expiry dates ────────
+
+  void _onPurchaseDateChanged(DateTime newDate) {
+    setState(() {
+      _purchaseDate = newDate;
+      if (_recognized != null && _isReceiptMode) {
+        _recognized = _recognized!.map((item) {
+          final shelfDays = item['estimated_shelf_days'] as int?;
+          if (shelfDays != null) {
+            final newExpiry = newDate.add(Duration(days: shelfDays));
+            return {
+              ...item,
+              'expiry_date': DateFormat('yyyy-MM-dd').format(newExpiry),
+            };
+          }
+          return item;
+        }).toList();
+      }
+    });
+  }
+
+  // ── Save ───────────────────────────────────────────────────
+
   Future<void> _saveSelected() async {
     final toSave = <Map<String, dynamic>>[];
     for (int i = 0; i < (_recognized?.length ?? 0); i++) {
       if (_selected[i]) toSave.add(_recognized![i]);
     }
-
     if (toSave.isEmpty) {
       _showSnack('저장할 식재료를 선택해주세요');
       return;
@@ -84,10 +130,17 @@ class _CameraScreenState extends State<CameraScreen> {
       for (final item in toSave) {
         await _ingredientSvc.addIngredient({
           'name': item['name'],
-          if (item['quantity'] != null) 'quantity': item['quantity'],
-          if (item['unit'] != null && item['unit'] != 'null')
-            'unit': item['unit'],
+          if (item['quantity'] != null && item['quantity'].toString() != 'null')
+            'quantity': item['quantity'] is num
+                ? (item['quantity'] as num).toDouble()
+                : double.tryParse(item['quantity'].toString()),
+          if (item['unit'] != null && item['unit'].toString() != 'null')
+            'unit': item['unit'].toString(),
           if (item['category'] != null) 'category': item['category'],
+          // Receipt mode includes expiry date
+          if (item['expiry_date'] != null &&
+              item['expiry_date'].toString().isNotEmpty)
+            'expiry_date': item['expiry_date'],
         });
       }
       if (mounted) {
@@ -116,20 +169,28 @@ class _CameraScreenState extends State<CameraScreen> {
     );
   }
 
+  // ── Build ──────────────────────────────────────────────────
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('냉장고 촬영',
+        title: const Text('촬영',
             style: TextStyle(fontWeight: FontWeight.bold)),
       ),
       body: SingleChildScrollView(
-        padding: const EdgeInsets.all(16),
+        padding: const EdgeInsets.fromLTRB(16, 8, 16, 100),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            _buildImageArea(),
+            _buildModeToggle(),
             const SizedBox(height: 16),
+            if (_isReceiptMode) ...[
+              _buildPurchaseDateRow(),
+              const SizedBox(height: 12),
+            ],
+            _buildImageArea(),
+            const SizedBox(height: 12),
             _buildPickButtons(),
             if (_recognized != null) ...[
               const SizedBox(height: 24),
@@ -137,12 +198,182 @@ class _CameraScreenState extends State<CameraScreen> {
               const SizedBox(height: 16),
               _buildSaveButton(),
             ],
-            const SizedBox(height: 80),
           ],
         ),
       ),
     );
   }
+
+  // ── Mode toggle ────────────────────────────────────────────
+
+  Widget _buildModeToggle() {
+    return Container(
+      padding: const EdgeInsets.all(4),
+      decoration: BoxDecoration(
+        color: const Color(0xFF252525),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: const Color(0xFF2A2A2A)),
+      ),
+      child: Row(
+        children: [
+          _modeTab(
+            icon: Icons.kitchen_outlined,
+            activeIcon: Icons.kitchen,
+            label: '냉장고 촬영',
+            mode: _ScanMode.fridge,
+          ),
+          _modeTab(
+            icon: Icons.receipt_long_outlined,
+            activeIcon: Icons.receipt_long,
+            label: '영수증 스캔',
+            mode: _ScanMode.receipt,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _modeTab({
+    required IconData icon,
+    required IconData activeIcon,
+    required String label,
+    required _ScanMode mode,
+  }) {
+    final isActive = _mode == mode;
+    return Expanded(
+      child: GestureDetector(
+        onTap: () => _switchMode(mode),
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 200),
+          padding: const EdgeInsets.symmetric(vertical: 11),
+          decoration: BoxDecoration(
+            color: isActive ? const Color(0xFF1A1A1A) : Colors.transparent,
+            borderRadius: BorderRadius.circular(10),
+            border: isActive
+                ? Border.all(color: const Color(0xFF76C442).withValues(alpha: 0.4))
+                : null,
+          ),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(
+                isActive ? activeIcon : icon,
+                size: 17,
+                color: isActive
+                    ? const Color(0xFF76C442)
+                    : const Color(0xFF6A6A6A),
+              ),
+              const SizedBox(width: 6),
+              Text(
+                label,
+                style: TextStyle(
+                  fontSize: 13,
+                  fontWeight:
+                      isActive ? FontWeight.bold : FontWeight.normal,
+                  color: isActive ? Colors.white : const Color(0xFF6A6A6A),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ── Purchase date row (receipt mode only) ──────────────────
+
+  Widget _buildPurchaseDateRow() {
+    return GestureDetector(
+      onTap: _pickPurchaseDate,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 13),
+        decoration: BoxDecoration(
+          color: const Color(0xFF1A1A1A),
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(
+              color: const Color(0xFFFF9F0A).withValues(alpha: 0.4)),
+        ),
+        child: Row(
+          children: [
+            Container(
+              width: 32,
+              height: 32,
+              decoration: BoxDecoration(
+                color: const Color(0xFFFF9F0A).withValues(alpha: 0.15),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: const Icon(Icons.receipt_long,
+                  color: Color(0xFFFF9F0A), size: 17),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    '구매일',
+                    style: TextStyle(
+                        fontSize: 11,
+                        color: Color(0xFF9A9A9A),
+                        fontWeight: FontWeight.w500),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    DateFormat('yyyy년 MM월 dd일').format(_purchaseDate),
+                    style: const TextStyle(
+                        fontSize: 15,
+                        fontWeight: FontWeight.bold,
+                        color: Colors.white),
+                  ),
+                ],
+              ),
+            ),
+            Text(
+              _isToday(_purchaseDate) ? '오늘' : _daysAgo(_purchaseDate),
+              style: const TextStyle(
+                  fontSize: 12, color: Color(0xFFFF9F0A)),
+            ),
+            const SizedBox(width: 6),
+            const Icon(Icons.edit_calendar_rounded,
+                size: 18, color: Color(0xFF6A6A6A)),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _pickPurchaseDate() async {
+    final d = await showDatePicker(
+      context: context,
+      initialDate: _purchaseDate,
+      firstDate: DateTime.now().subtract(const Duration(days: 30)),
+      lastDate: DateTime.now(),
+      builder: (ctx, child) => Theme(
+        data: Theme.of(ctx).copyWith(
+          colorScheme: const ColorScheme.dark(
+            primary: Color(0xFFFF9F0A),
+            onPrimary: Colors.black,
+            surface: Color(0xFF1A1A1A),
+            onSurface: Colors.white,
+          ),
+        ),
+        child: child!,
+      ),
+    );
+    if (d != null) _onPurchaseDateChanged(d);
+  }
+
+  bool _isToday(DateTime d) {
+    final now = DateTime.now();
+    return d.year == now.year && d.month == now.month && d.day == now.day;
+  }
+
+  String _daysAgo(DateTime d) {
+    final diff = DateTime.now().difference(d).inDays;
+    return diff == 1 ? '어제' : '$diff일 전';
+  }
+
+  // ── Image area ─────────────────────────────────────────────
 
   Widget _buildImageArea() {
     if (_image != null) {
@@ -153,7 +384,7 @@ class _CameraScreenState extends State<CameraScreen> {
             child: Image.file(
               _image!,
               width: double.infinity,
-              height: 280,
+              height: 260,
               fit: BoxFit.cover,
             ),
           ),
@@ -161,18 +392,31 @@ class _CameraScreenState extends State<CameraScreen> {
             Positioned.fill(
               child: Container(
                 decoration: BoxDecoration(
-                  color: Colors.black.withValues(alpha: 0.7),
+                  color: Colors.black.withValues(alpha: 0.72),
                   borderRadius: BorderRadius.circular(18),
                 ),
-                child: const Column(
+                child: Column(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
-                    CircularProgressIndicator(color: Color(0xFF76C442)),
-                    SizedBox(height: 16),
+                    const CircularProgressIndicator(
+                        color: Color(0xFF76C442)),
+                    const SizedBox(height: 16),
                     Text(
-                      'AI가 식재료를 인식하는 중...',
-                      style: TextStyle(color: Colors.white, fontSize: 16),
+                      _isReceiptMode
+                          ? 'AI가 영수증을 분석하는 중...'
+                          : 'AI가 식재료를 인식하는 중...',
+                      style: const TextStyle(
+                          color: Colors.white, fontSize: 15),
                     ),
+                    if (_isReceiptMode)
+                      const Padding(
+                        padding: EdgeInsets.only(top: 6),
+                        child: Text(
+                          '비식품 항목은 자동으로 제외됩니다',
+                          style: TextStyle(
+                              color: Color(0xFF9A9A9A), fontSize: 12),
+                        ),
+                      ),
                   ],
                 ),
               ),
@@ -181,12 +425,17 @@ class _CameraScreenState extends State<CameraScreen> {
       );
     }
 
+    // Placeholder
     return Container(
-      height: 240,
+      height: 220,
       decoration: BoxDecoration(
         color: const Color(0xFF1A1A1A),
         borderRadius: BorderRadius.circular(18),
-        border: Border.all(color: const Color(0xFF2A2A2A)),
+        border: Border.all(
+          color: _isReceiptMode
+              ? const Color(0xFFFF9F0A).withValues(alpha: 0.3)
+              : const Color(0xFF2A2A2A),
+        ),
       ),
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
@@ -195,35 +444,52 @@ class _CameraScreenState extends State<CameraScreen> {
             width: 64,
             height: 64,
             decoration: BoxDecoration(
-              color: const Color(0xFF252525),
+              color: _isReceiptMode
+                  ? const Color(0xFFFF9F0A).withValues(alpha: 0.1)
+                  : const Color(0xFF252525),
               borderRadius: BorderRadius.circular(16),
             ),
-            child: const Icon(Icons.camera_alt_outlined,
-                size: 32, color: Color(0xFF4A4A4A)),
+            child: Icon(
+              _isReceiptMode
+                  ? Icons.receipt_long_outlined
+                  : Icons.camera_alt_outlined,
+              size: 32,
+              color: _isReceiptMode
+                  ? const Color(0xFFFF9F0A)
+                  : const Color(0xFF4A4A4A),
+            ),
           ),
           const SizedBox(height: 16),
-          const Text(
-            '냉장고 사진을 촬영하거나\n갤러리에서 선택하세요',
+          Text(
+            _isReceiptMode
+                ? '마트 영수증을 촬영하거나\n갤러리에서 선택하세요'
+                : '냉장고 사진을 촬영하거나\n갤러리에서 선택하세요',
             textAlign: TextAlign.center,
-            style: TextStyle(
+            style: const TextStyle(
                 color: Color(0xFF9A9A9A), fontSize: 15, height: 1.5),
           ),
           const SizedBox(height: 8),
-          const Text(
-            'GPT-4o Vision이 식재료를 자동으로 인식합니다',
-            style: TextStyle(color: Color(0xFF5A5A5A), fontSize: 12),
+          Text(
+            _isReceiptMode
+                ? 'GPT-4o가 식재료만 자동 추출하고\n유통기한을 추정합니다'
+                : 'GPT-4o Vision이 식재료를 자동으로 인식합니다',
+            textAlign: TextAlign.center,
+            style: const TextStyle(
+                color: Color(0xFF5A5A5A), fontSize: 12, height: 1.4),
           ),
         ],
       ),
     );
   }
 
+  // ── Pick buttons ───────────────────────────────────────────
+
   Widget _buildPickButtons() {
     return Row(
       children: [
         Expanded(
           child: _actionButton(
-            icon: Icons.camera_alt,
+            icon: Icons.camera_alt_rounded,
             label: '카메라',
             onTap: () => _pick(ImageSource.camera),
           ),
@@ -240,10 +506,11 @@ class _CameraScreenState extends State<CameraScreen> {
     );
   }
 
-  Widget _actionButton(
-      {required IconData icon,
-      required String label,
-      required VoidCallback onTap}) {
+  Widget _actionButton({
+    required IconData icon,
+    required String label,
+    required VoidCallback onTap,
+  }) {
     return GestureDetector(
       onTap: onTap,
       child: Container(
@@ -271,23 +538,26 @@ class _CameraScreenState extends State<CameraScreen> {
     );
   }
 
+  // ── Recognized list ────────────────────────────────────────
+
   Widget _buildRecognizedList() {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
+        // Header
         Row(
           children: [
-            const Text(
-              '인식된 식재료',
-              style: TextStyle(
+            Text(
+              _isReceiptMode ? '추출된 식재료' : '인식된 식재료',
+              style: const TextStyle(
                   fontSize: 18,
                   fontWeight: FontWeight.bold,
                   letterSpacing: -0.3),
             ),
             const SizedBox(width: 10),
             Container(
-              padding:
-                  const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
+              padding: const EdgeInsets.symmetric(
+                  horizontal: 10, vertical: 3),
               decoration: BoxDecoration(
                 color: const Color(0xFF76C442).withValues(alpha: 0.15),
                 borderRadius: BorderRadius.circular(20),
@@ -300,16 +570,37 @@ class _CameraScreenState extends State<CameraScreen> {
                     fontSize: 12),
               ),
             ),
+            if (_isReceiptMode) ...[
+              const SizedBox(width: 8),
+              Container(
+                padding: const EdgeInsets.symmetric(
+                    horizontal: 8, vertical: 3),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFFF9F0A).withValues(alpha: 0.1),
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: const Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.auto_awesome,
+                        size: 10, color: Color(0xFFFF9F0A)),
+                    SizedBox(width: 3),
+                    Text('유통기한 자동 추정',
+                        style: TextStyle(
+                            fontSize: 10,
+                            color: Color(0xFFFF9F0A),
+                            fontWeight: FontWeight.w600)),
+                  ],
+                ),
+              ),
+            ],
             const Spacer(),
             GestureDetector(
-              onTap: () {
-                setState(() {
-                  _selected = List.filled(
-                    _recognized!.length,
-                    !_selected.every((e) => e),
-                  );
-                });
-              },
+              onTap: () => setState(() {
+                final allSelected = _selected.every((e) => e);
+                _selected = List.filled(
+                    _recognized!.length, !allSelected);
+              }),
               child: Text(
                 _selected.every((e) => e) ? '전체 해제' : '전체 선택',
                 style: const TextStyle(
@@ -321,113 +612,200 @@ class _CameraScreenState extends State<CameraScreen> {
           ],
         ),
         const SizedBox(height: 12),
-        ...List.generate(_recognized!.length, (i) {
-          final item = _recognized![i];
-          final qty = item['quantity'];
-          final unit = item['unit'];
-          final cat = item['category'];
-
-          return Container(
-            margin: const EdgeInsets.only(bottom: 8),
-            decoration: BoxDecoration(
-              color: const Color(0xFF1A1A1A),
-              borderRadius: BorderRadius.circular(14),
-              border: Border.all(
-                color: _selected[i]
-                    ? const Color(0xFF76C442).withValues(alpha: 0.4)
-                    : const Color(0xFF2A2A2A),
-              ),
-            ),
-            child: InkWell(
-              borderRadius: BorderRadius.circular(14),
-              onTap: () =>
-                  setState(() => _selected[i] = !_selected[i]),
-              child: Padding(
-                padding: const EdgeInsets.symmetric(
-                    horizontal: 14, vertical: 12),
-                child: Row(
-                  children: [
-                    AnimatedContainer(
-                      duration: const Duration(milliseconds: 150),
-                      width: 22,
-                      height: 22,
-                      decoration: BoxDecoration(
-                        color: _selected[i]
-                            ? const Color(0xFF76C442)
-                            : Colors.transparent,
-                        borderRadius: BorderRadius.circular(6),
-                        border: Border.all(
-                          color: _selected[i]
-                              ? const Color(0xFF76C442)
-                              : const Color(0xFF4A4A4A),
-                          width: 1.5,
-                        ),
-                      ),
-                      child: _selected[i]
-                          ? const Icon(Icons.check,
-                              size: 14, color: Colors.black)
-                          : null,
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            item['name']?.toString() ?? '',
-                            style: const TextStyle(
-                                fontWeight: FontWeight.w600,
-                                fontSize: 15),
-                          ),
-                          if ([qty, unit, cat].any((v) =>
-                              v != null && v.toString() != 'null'))
-                            Text(
-                              [
-                                if (qty != null &&
-                                    qty.toString() != 'null')
-                                  '$qty ${unit ?? ''}',
-                                if (cat != null &&
-                                    cat.toString() != 'null')
-                                  cat.toString(),
-                              ].join(' · '),
-                              style: const TextStyle(
-                                  color: Color(0xFF6A6A6A),
-                                  fontSize: 12),
-                            ),
-                        ],
-                      ),
-                    ),
-                    IconButton(
-                      icon: const Icon(Icons.edit_outlined,
-                          size: 18, color: Color(0xFF6A6A6A)),
-                      onPressed: () async {
-                        await Navigator.push<bool>(
-                          context,
-                          MaterialPageRoute(
-                            builder: (_) =>
-                                IngredientFormScreen(initialData: item),
-                          ),
-                        );
-                        setState(() => _selected[i] = false);
-                      },
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          );
-        }),
+        // Items
+        ...List.generate(
+          _recognized!.length,
+          (i) => Padding(
+            padding: const EdgeInsets.only(bottom: 10),
+            child: _buildRecognizedItem(i),
+          ),
+        ),
       ],
     );
   }
+
+  Widget _buildRecognizedItem(int i) {
+    final item = _recognized![i];
+    final name = item['name']?.toString() ?? '';
+    final qty = item['quantity'];
+    final unit = item['unit'];
+    final cat = item['category'];
+    final expiryStr = item['expiry_date']?.toString();
+    final expiryDate = (expiryStr != null && expiryStr.isNotEmpty)
+        ? DateTime.tryParse(expiryStr)
+        : null;
+    final days = ExpiryUtils.daysUntil(expiryDate);
+
+    return GestureDetector(
+      onTap: () => setState(() => _selected[i] = !_selected[i]),
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 150),
+        padding: const EdgeInsets.all(14),
+        decoration: BoxDecoration(
+          color: const Color(0xFF1A1A1A),
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(
+            color: _selected[i]
+                ? (days != null && days <= 3
+                    ? ExpiryUtils.color(days).withValues(alpha: 0.5)
+                    : const Color(0xFF76C442).withValues(alpha: 0.4))
+                : const Color(0xFF2A2A2A),
+            width: _selected[i] ? 1.5 : 1.0,
+          ),
+        ),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            // Checkbox
+            Padding(
+              padding: const EdgeInsets.only(top: 2),
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 150),
+                width: 22,
+                height: 22,
+                decoration: BoxDecoration(
+                  color: _selected[i]
+                      ? const Color(0xFF76C442)
+                      : Colors.transparent,
+                  borderRadius: BorderRadius.circular(6),
+                  border: Border.all(
+                    color: _selected[i]
+                        ? const Color(0xFF76C442)
+                        : const Color(0xFF4A4A4A),
+                    width: 1.5,
+                  ),
+                ),
+                child: _selected[i]
+                    ? const Icon(Icons.check,
+                        size: 14, color: Colors.black)
+                    : null,
+              ),
+            ),
+            const SizedBox(width: 12),
+            // Info
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  // Name + category
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          name,
+                          style: const TextStyle(
+                              fontWeight: FontWeight.bold,
+                              fontSize: 15,
+                              color: Colors.white),
+                        ),
+                      ),
+                      if (cat != null && cat.toString() != 'null')
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 7, vertical: 2),
+                          decoration: BoxDecoration(
+                            color: _catColor(cat.toString())
+                                .withValues(alpha: 0.15),
+                            borderRadius: BorderRadius.circular(6),
+                          ),
+                          child: Text(
+                            cat.toString(),
+                            style: TextStyle(
+                              fontSize: 10,
+                              color: _catColor(cat.toString()),
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ),
+                    ],
+                  ),
+                  const SizedBox(height: 5),
+                  // Quantity row
+                  if (qty != null && qty.toString() != 'null')
+                    Text(
+                      '수량: $qty ${unit != null && unit.toString() != 'null' ? unit : ''}',
+                      style: const TextStyle(
+                          color: Color(0xFF9A9A9A), fontSize: 12),
+                    ),
+                  // Expiry row (receipt mode)
+                  if (expiryDate != null && days != null) ...[
+                    const SizedBox(height: 4),
+                    Row(
+                      children: [
+                        Icon(Icons.event_rounded,
+                            size: 12,
+                            color: ExpiryUtils.color(days)),
+                        const SizedBox(width: 4),
+                        Text(
+                          '유통기한 ${DateFormat('yyyy.MM.dd').format(expiryDate)}',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: ExpiryUtils.color(days),
+                            fontWeight: (days <= 3)
+                                ? FontWeight.bold
+                                : FontWeight.normal,
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 6, vertical: 2),
+                          decoration: BoxDecoration(
+                            color: ExpiryUtils.color(days)
+                                .withValues(alpha: 0.15),
+                            borderRadius: BorderRadius.circular(5),
+                          ),
+                          child: Text(
+                            ExpiryUtils.label(days),
+                            style: TextStyle(
+                              fontSize: 10,
+                              fontWeight: FontWeight.bold,
+                              color: ExpiryUtils.color(days),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 4),
+                        Text(
+                          '(${item['estimated_shelf_days']}일)',
+                          style: const TextStyle(
+                              fontSize: 10,
+                              color: Color(0xFF5A5A5A)),
+                        ),
+                      ],
+                    ),
+                  ],
+                ],
+              ),
+            ),
+            // Edit button
+            IconButton(
+              icon: const Icon(Icons.edit_outlined,
+                  size: 18, color: Color(0xFF6A6A6A)),
+              onPressed: () async {
+                await Navigator.push<bool>(
+                  context,
+                  MaterialPageRoute(
+                    builder: (_) =>
+                        IngredientFormScreen(initialData: item),
+                  ),
+                );
+                setState(() => _selected[i] = false);
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // ── Save button ────────────────────────────────────────────
 
   Widget _buildSaveButton() {
     final count = _selected.where((e) => e).length;
     return Container(
       decoration: BoxDecoration(
         gradient: const LinearGradient(
-          colors: [Color(0xFF76C442), Color(0xFF4A9A24)],
-        ),
+            colors: [Color(0xFF76C442), Color(0xFF4A9A24)]),
         borderRadius: BorderRadius.circular(14),
       ),
       child: Material(
@@ -466,5 +844,21 @@ class _CameraScreenState extends State<CameraScreen> {
         ),
       ),
     );
+  }
+
+  // ── Helpers ────────────────────────────────────────────────
+
+  Color _catColor(String cat) {
+    switch (cat) {
+      case '채소': return const Color(0xFF4CAF50);
+      case '과일': return const Color(0xFFFF9800);
+      case '육류': return const Color(0xFFE57373);
+      case '어류': return const Color(0xFF42A5F5);
+      case '유제품': return const Color(0xFFFFCA28);
+      case '곡류': return const Color(0xFF8D6E63);
+      case '조미료': return const Color(0xFFAB47BC);
+      case '음료': return const Color(0xFF26C6DA);
+      default: return const Color(0xFF78909C);
+    }
   }
 }
