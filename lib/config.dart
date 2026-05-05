@@ -11,4 +11,7 @@ class AppConfig {
 
   static String get openAiApiKey =>
       dotenv.env['OPENAI_API_KEY'] ?? '';
+
+  static String get googleClientId =>
+      dotenv.env['GOOGLE_CLIENT_ID'] ?? '';
 }
