@@ -214,7 +214,7 @@ class _IngredientFormScreenState extends State<IngredientFormScreen> {
                 Expanded(
                   flex: 3,
                   child: DropdownButtonFormField<String>(
-                    value: _units.contains(_unitCtrl.text)
+                    initialValue: _units.contains(_unitCtrl.text)
                         ? _unitCtrl.text
                         : null,
                     dropdownColor: const Color(0xFF252525),
@@ -235,7 +235,7 @@ class _IngredientFormScreenState extends State<IngredientFormScreen> {
             const SizedBox(height: 14),
             // Category
             DropdownButtonFormField<String>(
-              value: _category,
+              initialValue: _category,
               dropdownColor: const Color(0xFF252525),
               style: const TextStyle(color: Colors.white),
               decoration: const InputDecoration(

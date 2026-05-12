@@ -6,6 +6,7 @@ import 'ingredients/ingredients_screen.dart';
 import 'camera/camera_screen.dart';
 import 'recipes/recipe_screen.dart';
 import 'settings/settings_screen.dart';
+import 'shopping/shopping_screen.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -21,6 +22,7 @@ class _HomeScreenState extends State<HomeScreen> {
     IngredientsScreen(),
     CameraScreen(),
     RecipeScreen(),
+    ShoppingScreen(),
     SettingsScreen(),
   ];
 
@@ -89,6 +91,11 @@ class _HomeScreenState extends State<HomeScreen> {
             icon: Icon(Icons.auto_awesome_outlined),
             selectedIcon: Icon(Icons.auto_awesome),
             label: '레시피',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.shopping_cart_outlined),
+            selectedIcon: Icon(Icons.shopping_cart),
+            label: '쇼핑',
           ),
           NavigationDestination(
             icon: Icon(Icons.person_outline),

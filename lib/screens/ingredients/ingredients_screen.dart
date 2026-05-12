@@ -412,9 +412,9 @@ class _IngredientsScreenState extends State<IngredientsScreen> {
                           CachedNetworkImage(
                             imageUrl: snap.data!,
                             fit: BoxFit.cover,
-                            placeholder: (_, __) =>
+                            placeholder: (_, _) =>
                                 _imagePlaceholder(catColor),
-                            errorWidget: (_, __, ___) =>
+                            errorWidget: (_, _, _) =>
                                 _imagePlaceholder(catColor),
                           ),
                           Positioned(

@@ -155,8 +155,19 @@ expiry_date = 구매일($dateStr)에 estimated_shelf_days를 더한 날짜''',
 
   // ── 레시피 추천 ───────────────────────────────────────────────
 
-  Future<String> recommendRecipes(List<String> ingredientNames) async {
+  Future<String> recommendRecipes(
+    List<String> ingredientNames, {
+    String? difficulty,
+    String? cookTime,
+  }) async {
     if (!hasApiKey) throw Exception('OpenAI API 키가 설정되지 않았습니다');
+
+    final filterBuf = StringBuffer();
+    if (difficulty != null) filterBuf.write('\n- 난이도: $difficulty');
+    if (cookTime != null) filterBuf.write('\n- 조리시간: $cookTime 이내');
+    final filterClause = filterBuf.isNotEmpty
+        ? '\n\n[필수 조건]$filterBuf\n위 조건에 정확히 맞는 레시피만 추천해주세요.'
+        : '';
 
     final response = await http.post(
       Uri.parse('${AppConfig.openAiBaseUrl}/chat/completions'),
@@ -184,7 +195,7 @@ expiry_date = 구매일($dateStr)에 estimated_shelf_days를 더한 날짜''',
                 '### 만들기\n'
                 '1. 단계\n'
                 '2. 단계\n\n'
-                '---',
+                '---$filterClause',
           }
         ],
         'max_tokens': 2000,
