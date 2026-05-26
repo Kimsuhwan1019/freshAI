@@ -19,6 +19,6 @@ class AppConfig {
   static String get googleClientId =>
       dotenv.env['GOOGLE_CLIENT_ID'] ?? '';
 
-  static String get googleMapsApiKey =>
-      dotenv.env['GOOGLE_MAPS_API_KEY'] ?? '';
+  static String get kakaoRestApiKey =>
+      dotenv.env['KAKAO_REST_API_KEY'] ?? '';
 }

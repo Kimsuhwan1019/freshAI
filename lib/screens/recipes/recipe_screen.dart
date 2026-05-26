@@ -1,11 +1,11 @@
-import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:cached_network_image/cached_network_image.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 import '../../models/ingredient.dart';
 import '../../services/ingredient_service.dart';
 import '../../services/openai_service.dart';
+import '../../services/recipe_service.dart';
 import '../../services/unsplash_service.dart';
+import '../../services/animation_settings.dart';
 import '../../utils/expiry_utils.dart';
 
 // ──────────────────────────────────────────────────────────────
@@ -22,6 +22,7 @@ class RecipeScreen extends StatefulWidget {
 class _RecipeScreenState extends State<RecipeScreen> {
   final _ingredientSvc = IngredientService();
   final _openAI = OpenAIService();
+  final _recipeSvc = RecipeService();
 
   List<Ingredient> _ingredients = [];
   Set<String> _selectedIds = {};
@@ -37,15 +38,26 @@ class _RecipeScreenState extends State<RecipeScreen> {
 
   String _selectedDifficulty = '상관없음';
   String _selectedCookTime = '상관없음';
+  String? _selectedRecipeStorageType;
+  bool _buttonPressed = false;
 
   // ── Computed ───────────────────────────────────────────────
 
   List<Ingredient> get _selectedIngredients =>
       _ingredients.where((i) => _selectedIds.contains(i.id)).toList();
 
-  List<Ingredient> get _expiringIngredients => _ingredients
-      .where((i) => ExpiryUtils.isExpiringSoon(i.expiryDate))
-      .toList();
+  List<Ingredient> get _expiringIngredients {
+    final result = _ingredients.where((i) {
+      final days = ExpiryUtils.daysUntil(i.expiryDate);
+      return days != null && days <= 3;
+    }).toList()
+      ..sort((a, b) {
+        final da = ExpiryUtils.daysUntil(a.expiryDate) ?? 999;
+        final db = ExpiryUtils.daysUntil(b.expiryDate) ?? 999;
+        return da.compareTo(db); // 만료된 것 먼저, 그 다음 임박순
+      });
+    return result;
+  }
 
   bool get _allSelected =>
       _selectedIds.length == _ingredients.length && _ingredients.isNotEmpty;
@@ -98,24 +110,22 @@ class _RecipeScreenState extends State<RecipeScreen> {
   // ── History ────────────────────────────────────────────────
 
   Future<void> _loadHistory() async {
-    final prefs = await SharedPreferences.getInstance();
-    final raw = prefs.getString('fresh_ai_recipe_history');
-    if (raw != null && mounted) {
-      try {
-        final list = jsonDecode(raw) as List;
-        setState(() {
-          _history = list
-              .map((e) => _HistoryEntry.fromJson(e as Map<String, dynamic>))
-              .toList();
-        });
-      } catch (_) {}
+    final data = await _recipeSvc.loadHistory();
+    if (mounted) {
+      setState(() {
+        _history = data.map((e) => _HistoryEntry(
+          id: e['id'] as String,
+          timestamp: DateTime.parse(e['timestamp'] as String),
+          ingredientNames: (e['ingredient_names'] as List).cast<String>(),
+          recipes: (e['recipes'] as List)
+              .map((r) => _RecipeCard(
+                    title: r['title'] as String,
+                    content: r['content'] as String,
+                  ))
+              .toList(),
+        )).toList();
+      });
     }
-  }
-
-  Future<void> _saveHistory() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('fresh_ai_recipe_history',
-        jsonEncode(_history.map((e) => e.toJson()).toList()));
   }
 
   Future<void> _addToHistory(
@@ -130,42 +140,40 @@ class _RecipeScreenState extends State<RecipeScreen> {
       _history.insert(0, entry);
       if (_history.length > 5) _history = _history.sublist(0, 5);
     });
-    await _saveHistory();
+    _recipeSvc.addHistory(
+      id: entry.id,
+      timestamp: entry.timestamp,
+      ingredientNames: names,
+      recipes: recipes
+          .map((r) => {'title': r.title, 'content': r.content})
+          .toList(),
+    );
   }
 
   Future<void> _clearHistory() async {
     setState(() => _history.clear());
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.remove('fresh_ai_recipe_history');
+    await _recipeSvc.clearHistory();
   }
 
   Future<void> _deleteHistoryEntry(String id) async {
     setState(() => _history.removeWhere((e) => e.id == id));
-    await _saveHistory();
+    await _recipeSvc.deleteHistoryEntry(id);
   }
 
   // ── Favorites ──────────────────────────────────────────────
 
   Future<void> _loadFavorites() async {
-    final prefs = await SharedPreferences.getInstance();
-    final raw = prefs.getString('fresh_ai_favorites');
-    if (raw != null && mounted) {
-      try {
-        final list = jsonDecode(raw) as List;
-        setState(() {
-          _favorites = list
-              .map((e) => _FavoriteRecipe.fromJson(e as Map<String, dynamic>))
-              .toList();
-          _favoriteIds = _favorites.map((f) => f.title).toSet();
-        });
-      } catch (_) {}
+    final data = await _recipeSvc.loadFavorites();
+    if (mounted) {
+      setState(() {
+        _favorites = data.map((e) => _FavoriteRecipe(
+          title: e['title'] as String,
+          content: e['content'] as String,
+          savedAt: DateTime.parse(e['saved_at'] as String),
+        )).toList();
+        _favoriteIds = _favorites.map((f) => f.title).toSet();
+      });
     }
-  }
-
-  Future<void> _saveFavorites() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('fresh_ai_favorites',
-        jsonEncode(_favorites.map((f) => f.toJson()).toList()));
   }
 
   void _toggleFavorite(_RecipeCard recipe) {
@@ -183,12 +191,11 @@ class _RecipeScreenState extends State<RecipeScreen> {
       savedAt: DateTime.now(),
     );
     setState(() {
-      // Remove duplicate if re-adding
       _favorites.removeWhere((f) => f.title == recipe.title);
       _favorites.insert(0, fav);
       _favoriteIds.add(recipe.title);
     });
-    _saveFavorites();
+    _recipeSvc.addFavorite(recipe.title, recipe.content);
   }
 
   void _removeFavorite(String title) {
@@ -196,7 +203,7 @@ class _RecipeScreenState extends State<RecipeScreen> {
       _favorites.removeWhere((f) => f.title == title);
       _favoriteIds.remove(title);
     });
-    _saveFavorites();
+    _recipeSvc.removeFavorite(title);
   }
 
   void _confirmRemoveFavorite(String title) {
@@ -231,8 +238,7 @@ class _RecipeScreenState extends State<RecipeScreen> {
       _favorites.clear();
       _favoriteIds.clear();
     });
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.remove('fresh_ai_favorites');
+    await _recipeSvc.clearFavorites();
   }
 
   // ── Selection ──────────────────────────────────────────────
@@ -249,6 +255,24 @@ class _RecipeScreenState extends State<RecipeScreen> {
       setState(() => _selectedIds = _ingredients.map((i) => i.id).toSet());
 
   void _deselectAll() => setState(() => _selectedIds.clear());
+
+  void _toggleIngredientsByName(String name, List<String> ids) =>
+      setState(() {
+        if (ids.any((id) => _selectedIds.contains(id))) {
+          _selectedIds.removeAll(ids);
+        } else {
+          _selectedIds.addAll(ids);
+        }
+      });
+
+  Color _recipeStorageColor(String? type) {
+    switch (type) {
+      case '냉장': return const Color(0xFF42A5F5);
+      case '냉동': return const Color(0xFF90CAF9);
+      case '상온': return const Color(0xFFFF9F0A);
+      default: return const Color(0xFF76C442);
+    }
+  }
 
   // ── Recipe generation ──────────────────────────────────────
 
@@ -284,12 +308,6 @@ class _RecipeScreenState extends State<RecipeScreen> {
     }
   }
 
-  Future<void> _getRecipesForExpiring() async {
-    final expiring = _expiringIngredients;
-    if (expiring.isEmpty) return;
-    setState(() => _selectedIds = expiring.map((i) => i.id).toSet());
-    await _getRecipes();
-  }
 
   List<_RecipeCard> _parseRecipes(String content) {
     return content
@@ -322,8 +340,6 @@ class _RecipeScreenState extends State<RecipeScreen> {
   // ── Cooking complete ───────────────────────────────────────
 
   Future<void> _showCookingCompleteDialog(_RecipeCard recipe) async {
-    // Supabase에서 최신 데이터를 직접 가져와 freshIngredients로 사용
-    // (상태 업데이트 타이밍과 무관하게 항상 최신 수량 반영)
     List<Ingredient> freshIngredients = List.from(_ingredients);
     try {
       freshIngredients = await _ingredientSvc.getIngredients();
@@ -333,7 +349,7 @@ class _RecipeScreenState extends State<RecipeScreen> {
     if (!mounted) return;
 
     final names = _parseIngredientsFromRecipe(recipe.content);
-    final entries = names.map((name) {
+    final entries = names.expand<_CookingEntry>((name) {
       final lower = name.toLowerCase();
       final candidates = freshIngredients.where((i) {
         final n = i.name.toLowerCase();
@@ -345,12 +361,8 @@ class _RecipeScreenState extends State<RecipeScreen> {
           if (b.expiryDate == null) return -1;
           return a.expiryDate!.compareTo(b.expiryDate!);
         });
-      if (candidates.isEmpty) return null;
-      return _CookingIngredientEntry(
-        recipeName: name,
-        candidates: candidates,
-      );
-    }).whereType<_CookingIngredientEntry>().toList();
+      return candidates.map((c) => _CookingEntry(recipeName: name, ingredient: c));
+    }).toList();
 
     showDialog(
       context: context,
@@ -396,12 +408,10 @@ class _RecipeScreenState extends State<RecipeScreen> {
     return names.toSet().toList();
   }
 
-  Future<void> _applyIngredientUsage(
-      List<_CookingIngredientEntry> entries) async {
+  Future<void> _applyIngredientUsage(List<_CookingEntry> entries) async {
     for (final entry in entries.where((e) => e.included)) {
-      final ingredient = entry.selected;
-      final used =
-          double.tryParse(entry.qtyCtrl.text.trim()) ?? 1.0;
+      final ingredient = entry.ingredient;
+      final used = double.tryParse(entry.qtyCtrl.text.trim()) ?? 1.0;
       final current = ingredient.quantity ?? 1.0;
       final newQty = current - used;
 
@@ -415,9 +425,7 @@ class _RecipeScreenState extends State<RecipeScreen> {
       }
     }
     await _loadIngredients();
-    if (mounted) {
-      _showSnack('요리 완료! 식재료가 업데이트됐어요 🎉');
-    }
+    if (mounted) _showSnack('요리 완료! 식재료가 업데이트됐어요 🎉');
   }
 
   // ── Build ──────────────────────────────────────────────────
@@ -570,7 +578,7 @@ class _RecipeScreenState extends State<RecipeScreen> {
                   fontSize: 24,
                   letterSpacing: -0.5)),
           if (_ingredients.isNotEmpty)
-            Text('${selected.length}개 식재료 선택됨',
+            Text('${selected.map((i) => i.name).toSet().length}종류 선택됨',
                 style: const TextStyle(
                     fontSize: 12,
                     color: Color(0xFF76C442),
@@ -590,19 +598,27 @@ class _RecipeScreenState extends State<RecipeScreen> {
   // ── Expiring soon section ──────────────────────────────────
 
   Widget _buildExpiringSoonSection(List<Ingredient> expiring) {
+    final hasExpired = expiring.any(
+        (i) => (ExpiryUtils.daysUntil(i.expiryDate) ?? 1) <= 0);
+
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
         color: const Color(0xFF1A1A1A),
         borderRadius: BorderRadius.circular(18),
         border: Border.all(
-            color: const Color(0xFFFF9F0A).withValues(alpha: 0.5),
-            width: 1.5),
+          color: hasExpired
+              ? const Color(0xFFFF453A).withValues(alpha: 0.5)
+              : const Color(0xFFFF9F0A).withValues(alpha: 0.5),
+          width: 1.5,
+        ),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          // Header
           Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Container(
                 width: 34,
@@ -619,82 +635,98 @@ class _RecipeScreenState extends State<RecipeScreen> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text('곧 만료되는 식재료로 만들 수 있는 레시피',
+                    Text('아래 식재료들을 먼저 사용해보세요!',
                         style: TextStyle(
                             fontWeight: FontWeight.bold,
                             fontSize: 14,
                             color: Colors.white,
                             letterSpacing: -0.2)),
-                    Text('빨리 사용하지 않으면 버려야 해요',
-                        style: TextStyle(
-                            fontSize: 11, color: Color(0xFF9A9A9A))),
+                    SizedBox(height: 3),
+                    Text(
+                      '재료 선택 칸에서 선택 후 레시피를 추천받을 수 있어요',
+                      style: TextStyle(
+                          fontSize: 11, color: Color(0xFF9A9A9A)),
+                    ),
                   ],
                 ),
               ),
             ],
           ),
           const SizedBox(height: 14),
+          // Ingredient chips
           Wrap(
             spacing: 8,
             runSpacing: 8,
             children: expiring.map((i) {
               final days = ExpiryUtils.daysUntil(i.expiryDate)!;
-              return Container(
-                padding: const EdgeInsets.symmetric(
-                    horizontal: 10, vertical: 5),
-                decoration: BoxDecoration(
-                  color: ExpiryUtils.color(days).withValues(alpha: 0.1),
-                  borderRadius: BorderRadius.circular(20),
-                  border: Border.all(
-                      color: ExpiryUtils.color(days)
-                          .withValues(alpha: 0.4)),
-                ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Text(i.name,
-                        style: const TextStyle(
-                            fontSize: 12,
-                            color: Colors.white,
-                            fontWeight: FontWeight.w500)),
-                    const SizedBox(width: 5),
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 5, vertical: 1),
-                      decoration: BoxDecoration(
-                        color: ExpiryUtils.color(days),
-                        borderRadius: BorderRadius.circular(4),
+              final chipColor = ExpiryUtils.color(days);
+              final isSelected = _selectedIds.contains(i.id);
+
+              return GestureDetector(
+                onTap: () => setState(() {
+                  if (isSelected) {
+                    _selectedIds.remove(i.id);
+                  } else {
+                    _selectedIds.add(i.id);
+                  }
+                }),
+                child: AnimatedContainer(
+                  duration: const Duration(milliseconds: 180),
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 10, vertical: 6),
+                  decoration: BoxDecoration(
+                    color: isSelected
+                        ? const Color(0xFF76C442).withValues(alpha: 0.18)
+                        : chipColor.withValues(alpha: 0.1),
+                    borderRadius: BorderRadius.circular(20),
+                    border: Border.all(
+                      color: isSelected
+                          ? const Color(0xFF76C442)
+                          : chipColor.withValues(alpha: 0.5),
+                      width: isSelected ? 1.5 : 1.0,
+                    ),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (isSelected) ...[
+                        const Icon(Icons.check_rounded,
+                            size: 12, color: Color(0xFF76C442)),
+                        const SizedBox(width: 3),
+                      ],
+                      Text(
+                        i.name,
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: isSelected
+                              ? const Color(0xFF76C442)
+                              : Colors.white,
+                          fontWeight: isSelected
+                              ? FontWeight.bold
+                              : FontWeight.w500,
+                        ),
                       ),
-                      child: Text(ExpiryUtils.label(days),
+                      const SizedBox(width: 5),
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 5, vertical: 1),
+                        decoration: BoxDecoration(
+                          color: chipColor,
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                        child: Text(
+                          ExpiryUtils.label(days),
                           style: const TextStyle(
                               fontSize: 9,
                               color: Colors.white,
-                              fontWeight: FontWeight.bold)),
-                    ),
-                  ],
+                              fontWeight: FontWeight.bold),
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
               );
             }).toList(),
-          ),
-          const SizedBox(height: 14),
-          SizedBox(
-            width: double.infinity,
-            child: ElevatedButton.icon(
-              onPressed: _isLoading ? null : _getRecipesForExpiring,
-              icon: const Icon(Icons.auto_awesome, size: 18),
-              label: Text(
-                  '이 ${expiring.length}개 재료로 지금 추천받기',
-                  style: const TextStyle(
-                      fontWeight: FontWeight.bold, fontSize: 14)),
-              style: ElevatedButton.styleFrom(
-                backgroundColor: const Color(0xFFFF9F0A),
-                foregroundColor: Colors.black,
-                padding: const EdgeInsets.symmetric(vertical: 12),
-                shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12)),
-                elevation: 0,
-              ),
-            ),
           ),
         ],
       ),
@@ -704,6 +736,18 @@ class _RecipeScreenState extends State<RecipeScreen> {
   // ── Ingredient selector ────────────────────────────────────
 
   Widget _buildIngredientSelector(List<Ingredient> selected) {
+    // Filter by storage type, deduplicate by name, sort alphabetically
+    final filteredByStorage = _selectedRecipeStorageType == null
+        ? _ingredients
+        : _ingredients
+            .where((i) => i.storageType == _selectedRecipeStorageType)
+            .toList();
+    final nameToIds = <String, List<String>>{};
+    for (final i in filteredByStorage) {
+      nameToIds.putIfAbsent(i.name, () => []).add(i.id);
+    }
+    final uniqueNames = nameToIds.keys.toList()..sort();
+
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
@@ -744,7 +788,7 @@ class _RecipeScreenState extends State<RecipeScreen> {
                     borderRadius: BorderRadius.circular(20),
                   ),
                   child: Text(
-                    '${selected.length} / ${_ingredients.length}',
+                    '${selected.map((i) => i.name).toSet().length} / ${_ingredients.map((i) => i.name).toSet().length}종류',
                     style: TextStyle(
                       fontSize: 11,
                       fontWeight: FontWeight.bold,
@@ -778,6 +822,58 @@ class _RecipeScreenState extends State<RecipeScreen> {
                 ),
             ],
           ),
+          // Storage type filter tabs
+          if (_ingredients.isNotEmpty) ...[
+            const SizedBox(height: 10),
+            SizedBox(
+              height: 32,
+              child: ListView(
+                scrollDirection: Axis.horizontal,
+                children: [
+                  (null, '전체'),
+                  ('냉장', '🧊 냉장'),
+                  ('냉동', '❄️ 냉동'),
+                  ('상온', '🌡️ 상온'),
+                ].map((t) {
+                  final (type, label) = t;
+                  final isTab = _selectedRecipeStorageType == type;
+                  final color = _recipeStorageColor(type);
+                  return Padding(
+                    padding: const EdgeInsets.only(right: 6),
+                    child: GestureDetector(
+                      onTap: () => setState(
+                          () => _selectedRecipeStorageType = type),
+                      child: AnimatedContainer(
+                        duration: const Duration(milliseconds: 150),
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 12, vertical: 5),
+                        decoration: BoxDecoration(
+                          color: isTab
+                              ? color.withValues(alpha: 0.15)
+                              : const Color(0xFF252525),
+                          borderRadius: BorderRadius.circular(16),
+                          border: Border.all(
+                            color: isTab ? color : const Color(0xFF2A2A2A),
+                            width: isTab ? 1.5 : 1.0,
+                          ),
+                        ),
+                        child: Text(
+                          label,
+                          style: TextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.w600,
+                            color: isTab
+                                ? color
+                                : const Color(0xFF9A9A9A),
+                          ),
+                        ),
+                      ),
+                    ),
+                  );
+                }).toList(),
+              ),
+            ),
+          ],
           const SizedBox(height: 14),
           if (_ingredients.isEmpty)
             const Padding(
@@ -786,17 +882,28 @@ class _RecipeScreenState extends State<RecipeScreen> {
                   style: TextStyle(
                       color: Color(0xFF6A6A6A), fontSize: 13)),
             )
+          else if (uniqueNames.isEmpty)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 8),
+              child: Text('해당 보관 방법의 식재료가 없습니다.',
+                  style: TextStyle(
+                      color: Color(0xFF6A6A6A), fontSize: 13)),
+            )
           else
             Wrap(
               spacing: 8,
               runSpacing: 8,
-              children: _ingredients
-                  .map((i) => _IngredientChip(
-                        ingredient: i,
-                        selected: _selectedIds.contains(i.id),
-                        onTap: () => _toggleIngredient(i.id),
-                      ))
-                  .toList(),
+              children: uniqueNames.map((name) {
+                final ids = nameToIds[name]!;
+                final isSelected =
+                    ids.any((id) => _selectedIds.contains(id));
+                return _IngredientChip(
+                  ingredient:
+                      _ingredients.firstWhere((i) => i.name == name),
+                  selected: isSelected,
+                  onTap: () => _toggleIngredientsByName(name, ids),
+                );
+              }).toList(),
             ),
         ],
       ),
@@ -936,7 +1043,7 @@ class _RecipeScreenState extends State<RecipeScreen> {
           const SizedBox(width: 8),
           Expanded(
             child: Text(
-              '선택이 변경됐어요 — ${selected.length}개로 다시 추천받으세요',
+              '선택이 변경됐어요 — ${selected.map((i) => i.name).toSet().length}종류로 다시 추천받으세요',
               style: const TextStyle(
                   fontSize: 12, color: Color(0xFFFF9F0A)),
             ),
@@ -967,37 +1074,50 @@ class _RecipeScreenState extends State<RecipeScreen> {
 
   Widget _buildRecommendButton(List<Ingredient> selected) {
     final disabled = selected.isEmpty;
+    final animEnabled = AnimationSettings().isEnabled;
     return AnimatedOpacity(
       opacity: disabled ? 0.45 : 1.0,
       duration: const Duration(milliseconds: 200),
-      child: Container(
-        decoration: BoxDecoration(
-          gradient: disabled
-              ? null
-              : const LinearGradient(
-                  colors: [Color(0xFF76C442), Color(0xFF4A9A24)],
-                  begin: Alignment.topLeft,
-                  end: Alignment.bottomRight,
-                ),
-          color: disabled ? const Color(0xFF252525) : null,
-          borderRadius: BorderRadius.circular(16),
-          boxShadow: disabled
-              ? null
-              : [
-                  BoxShadow(
-                    color: const Color(0xFF76C442)
-                        .withValues(alpha: 0.3),
-                    blurRadius: 16,
-                    offset: const Offset(0, 6),
+      child: AnimatedScale(
+        scale: (animEnabled && _buttonPressed && !disabled) ? 0.95 : 1.0,
+        duration: const Duration(milliseconds: 90),
+        child: Container(
+          decoration: BoxDecoration(
+            gradient: disabled
+                ? null
+                : const LinearGradient(
+                    colors: [Color(0xFF76C442), Color(0xFF4A9A24)],
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
                   ),
-                ],
-        ),
-        child: Material(
-          color: Colors.transparent,
-          child: InkWell(
-            onTap: disabled ? null : _getRecipes,
+            color: disabled ? const Color(0xFF252525) : null,
             borderRadius: BorderRadius.circular(16),
-            child: Padding(
+            boxShadow: disabled
+                ? null
+                : [
+                    BoxShadow(
+                      color: const Color(0xFF76C442)
+                          .withValues(alpha: 0.3),
+                      blurRadius: 16,
+                      offset: const Offset(0, 6),
+                    ),
+                  ],
+          ),
+          child: Material(
+            color: Colors.transparent,
+            child: InkWell(
+              onTap: disabled ? null : _getRecipes,
+              onTapDown: disabled
+                  ? null
+                  : (_) => setState(() => _buttonPressed = true),
+              onTapUp: disabled
+                  ? null
+                  : (_) => setState(() => _buttonPressed = false),
+              onTapCancel: disabled
+                  ? null
+                  : () => setState(() => _buttonPressed = false),
+              borderRadius: BorderRadius.circular(16),
+              child: Padding(
               padding: const EdgeInsets.symmetric(vertical: 18),
               child: Row(
                 mainAxisAlignment: MainAxisAlignment.center,
@@ -1011,7 +1131,7 @@ class _RecipeScreenState extends State<RecipeScreen> {
                   Text(
                     disabled
                         ? '식재료를 선택해주세요'
-                        : '${selected.length}개 식재료로 추천받기',
+                        : '${selected.map((i) => i.name).toSet().length}종류 식재료로 추천받기',
                     style: TextStyle(
                       fontSize: 17,
                       fontWeight: FontWeight.bold,
@@ -1027,7 +1147,8 @@ class _RecipeScreenState extends State<RecipeScreen> {
           ),
         ),
       ),
-    );
+    ),
+  );
   }
 
   Widget _refreshButton(List<Ingredient> selected) {
@@ -1047,7 +1168,7 @@ class _RecipeScreenState extends State<RecipeScreen> {
             const Icon(Icons.refresh_rounded,
                 size: 14, color: Color(0xFF76C442)),
             const SizedBox(width: 4),
-            Text('${selected.length}개로 다시',
+            Text('${selected.map((i) => i.name).toSet().length}종류로 다시',
                 style: const TextStyle(
                     fontSize: 12,
                     color: Color(0xFF76C442),
@@ -1835,12 +1956,6 @@ class _FavoriteRecipe {
         'savedAt': savedAt.toIso8601String(),
       };
 
-  factory _FavoriteRecipe.fromJson(Map<String, dynamic> json) =>
-      _FavoriteRecipe(
-        title: json['title'] as String,
-        content: json['content'] as String,
-        savedAt: DateTime.parse(json['savedAt'] as String),
-      );
 }
 
 class _HistoryEntry {
@@ -1866,19 +1981,6 @@ class _HistoryEntry {
             .toList(),
       };
 
-  factory _HistoryEntry.fromJson(Map<String, dynamic> json) =>
-      _HistoryEntry(
-        id: json['id'] as String,
-        timestamp: DateTime.parse(json['timestamp'] as String),
-        ingredientNames:
-            (json['ingredientNames'] as List).cast<String>(),
-        recipes: (json['recipes'] as List)
-            .map((r) => _RecipeCard(
-                  title: r['title'] as String,
-                  content: r['content'] as String,
-                ))
-            .toList(),
-      );
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -2161,19 +2263,19 @@ class _RecipeCardWidgetState extends State<_RecipeCardWidget> {
 
 // ── Cooking complete data ──────────────────────────────────────────────────────
 
-class _CookingIngredientEntry {
+class _CookingEntry {
   final String recipeName;
-  final List<Ingredient> candidates;
-  int selectedIndex = 0;
+  final Ingredient ingredient;
   bool included = true;
   final TextEditingController qtyCtrl;
 
-  _CookingIngredientEntry({
-    required this.recipeName,
-    required this.candidates,
-  }) : qtyCtrl = TextEditingController(text: '1');
+  _CookingEntry({required this.recipeName, required this.ingredient})
+      : qtyCtrl = TextEditingController(text: _fmt(ingredient.quantity));
 
-  Ingredient get selected => candidates[selectedIndex];
+  static String _fmt(double? q) {
+    if (q == null) return '1';
+    return q % 1 == 0 ? q.toInt().toString() : q.toString();
+  }
 
   void dispose() => qtyCtrl.dispose();
 }
@@ -2182,8 +2284,8 @@ class _CookingIngredientEntry {
 
 class _CookingCompleteDialog extends StatefulWidget {
   final String recipeName;
-  final List<_CookingIngredientEntry> entries;
-  final Future<void> Function(List<_CookingIngredientEntry>) onConfirm;
+  final List<_CookingEntry> entries;
+  final Future<void> Function(List<_CookingEntry>) onConfirm;
 
   const _CookingCompleteDialog({
     required this.recipeName,
@@ -2196,8 +2298,7 @@ class _CookingCompleteDialog extends StatefulWidget {
       _CookingCompleteDialogState();
 }
 
-class _CookingCompleteDialogState
-    extends State<_CookingCompleteDialog> {
+class _CookingCompleteDialogState extends State<_CookingCompleteDialog> {
   bool _loading = false;
 
   @override
@@ -2220,6 +2321,13 @@ class _CookingCompleteDialogState
 
   @override
   Widget build(BuildContext context) {
+    // pre-compute group info for sort hint and row rendering
+    final nameCount = <String, int>{};
+    for (final e in widget.entries) {
+      nameCount[e.recipeName] = (nameCount[e.recipeName] ?? 0) + 1;
+    }
+    final seenNames = <String>{};
+
     return Dialog(
       backgroundColor: const Color(0xFF1A1A1A),
       shape: RoundedRectangleBorder(
@@ -2257,8 +2365,7 @@ class _CookingCompleteDialogState
                   const SizedBox(height: 6),
                   Text(widget.recipeName,
                       style: const TextStyle(
-                          color: Color(0xFF9A9A9A),
-                          fontSize: 13)),
+                          color: Color(0xFF9A9A9A), fontSize: 13)),
                   const SizedBox(height: 4),
                   const Text(
                     '사용한 수량을 입력하고 확인을 누르면 식재료가 자동 차감돼요.',
@@ -2291,44 +2398,43 @@ class _CookingCompleteDialogState
                       ),
                     )
                   : SingleChildScrollView(
-                      padding: const EdgeInsets.symmetric(
-                          vertical: 8),
+                      padding:
+                          const EdgeInsets.symmetric(vertical: 8),
                       child: Column(
-                        children: widget.entries
-                            .map((e) => _buildEntryRow(e))
-                            .toList(),
+                        children: widget.entries.map((e) {
+                          final isMulti =
+                              (nameCount[e.recipeName] ?? 1) > 1;
+                          final isFirst = seenNames.add(e.recipeName);
+                          return _buildEntryRow(e,
+                              isMulti: isMulti, isFirst: isFirst);
+                        }).toList(),
                       ),
                     ),
             ),
             const Divider(height: 1, color: Color(0xFF252525)),
             // Actions
             Padding(
-              padding:
-                  const EdgeInsets.fromLTRB(16, 12, 16, 16),
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
               child: Row(
                 mainAxisAlignment: MainAxisAlignment.end,
                 children: [
                   TextButton(
-                    onPressed: _loading
-                        ? null
-                        : () => Navigator.pop(context),
+                    onPressed:
+                        _loading ? null : () => Navigator.pop(context),
                     child: const Text('취소',
                         style:
                             TextStyle(color: Color(0xFF9A9A9A))),
                   ),
                   const SizedBox(width: 8),
                   ElevatedButton(
-                    onPressed:
-                        _loading ? null : _confirm,
+                    onPressed: _loading ? null : _confirm,
                     style: ElevatedButton.styleFrom(
-                      backgroundColor:
-                          const Color(0xFF76C442),
+                      backgroundColor: const Color(0xFF76C442),
                       foregroundColor: Colors.black,
                       padding: const EdgeInsets.symmetric(
                           horizontal: 24, vertical: 12),
                       shape: RoundedRectangleBorder(
-                          borderRadius:
-                              BorderRadius.circular(12)),
+                          borderRadius: BorderRadius.circular(12)),
                       elevation: 0,
                     ),
                     child: _loading
@@ -2341,8 +2447,7 @@ class _CookingCompleteDialogState
                           )
                         : const Text('확인',
                             style: TextStyle(
-                                fontWeight:
-                                    FontWeight.bold)),
+                                fontWeight: FontWeight.bold)),
                   ),
                 ],
               ),
@@ -2353,27 +2458,58 @@ class _CookingCompleteDialogState
     );
   }
 
-  Widget _buildEntryRow(_CookingIngredientEntry entry) {
-    final c = entry.selected;
+  Widget _buildEntryRow(
+    _CookingEntry entry, {
+    required bool isMulti,
+    required bool isFirst,
+  }) {
+    final c = entry.ingredient;
     final days = ExpiryUtils.daysUntil(c.expiryDate);
     final expiryColor = days != null ? ExpiryUtils.color(days) : null;
     final expiryLabel = days != null ? ExpiryUtils.label(days) : null;
 
-    // 수량 표시: 5.0 → "5", 0.5 → "0.5"
     final qtyStr = c.quantity == null
         ? '?'
         : c.quantity! % 1 == 0
             ? c.quantity!.toInt().toString()
             : c.quantity!.toString();
 
+    final inputQty =
+        double.tryParse(entry.qtyCtrl.text.trim());
+    final isOver = inputQty != null &&
+        c.quantity != null &&
+        inputQty > c.quantity!;
+
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+      padding: const EdgeInsets.symmetric(
+          horizontal: 16, vertical: 10),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          // 정렬 안내 (동일 이름 그룹 첫 번째에만 표시)
+          if (isMulti && isFirst)
+            Padding(
+              padding:
+                  const EdgeInsets.only(left: 44, bottom: 8),
+              child: Row(
+                children: [
+                  const Icon(Icons.sort_rounded,
+                      size: 11, color: Color(0xFF5B9BD5)),
+                  const SizedBox(width: 4),
+                  Text(
+                    '유통기한이 임박한 순서로 정렬됩니다',
+                    style: TextStyle(
+                        fontSize: 11,
+                        color: const Color(0xFF5B9BD5)
+                            .withValues(alpha: 0.9)),
+                  ),
+                ],
+              ),
+            ),
           Row(
             crossAxisAlignment: CrossAxisAlignment.center,
             children: [
+              // 포함 여부 체크박스
               SizedBox(
                 width: 36,
                 height: 36,
@@ -2389,13 +2525,13 @@ class _CookingCompleteDialogState
                 ),
               ),
               const SizedBox(width: 4),
-              // 이름 + 보유수량 한 줄 표시
+              // 이름 + 유통기한 + 보유량
               Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      '${entry.recipeName} $qtyStr${c.unit ?? ''}',
+                      entry.recipeName,
                       style: TextStyle(
                         fontSize: 15,
                         fontWeight: FontWeight.w500,
@@ -2404,29 +2540,48 @@ class _CookingCompleteDialogState
                             : const Color(0xFF5A5A5A),
                       ),
                     ),
-                    if (expiryLabel != null)
-                      Text(expiryLabel,
-                          style: TextStyle(
-                              fontSize: 11, color: expiryColor)),
+                    Row(
+                      children: [
+                        if (expiryLabel != null) ...[
+                          Text(expiryLabel,
+                              style: TextStyle(
+                                  fontSize: 11,
+                                  color: expiryColor,
+                                  fontWeight: FontWeight.w600)),
+                          const SizedBox(width: 6),
+                        ],
+                        Text('보유 $qtyStr${c.unit ?? ''}',
+                            style: const TextStyle(
+                                fontSize: 11,
+                                color: Color(0xFF7A7A7A))),
+                      ],
+                    ),
                   ],
                 ),
               ),
-              // 사용량 직접 입력
+              // 사용량 입력
               if (entry.included)
                 SizedBox(
-                  width: 80,
+                  width: 90,
                   child: TextField(
                     controller: entry.qtyCtrl,
                     keyboardType:
                         const TextInputType.numberWithOptions(
                             decimal: true),
                     textAlign: TextAlign.center,
-                    style: const TextStyle(
-                        fontSize: 14, fontWeight: FontWeight.bold),
+                    style: TextStyle(
+                      fontSize: 14,
+                      fontWeight: FontWeight.bold,
+                      color: isOver
+                          ? const Color(0xFFFF453A)
+                          : Colors.white,
+                    ),
+                    onChanged: (_) => setState(() {}),
                     decoration: InputDecoration(
                       isDense: true,
-                      contentPadding: const EdgeInsets.symmetric(
-                          horizontal: 8, vertical: 8),
+                      contentPadding:
+                          const EdgeInsets.symmetric(
+                              horizontal: 8, vertical: 8),
                       hintText: '1',
                       hintStyle: const TextStyle(
                           color: Color(0xFF5A5A5A)),
@@ -2437,93 +2592,56 @@ class _CookingCompleteDialogState
                                   color: Color(0xFF7A7A7A)))
                           : null,
                       filled: true,
-                      fillColor: const Color(0xFF252525),
+                      fillColor: isOver
+                          ? const Color(0xFFFF453A)
+                              .withValues(alpha: 0.08)
+                          : const Color(0xFF252525),
                       border: OutlineInputBorder(
                         borderRadius: BorderRadius.circular(8),
-                        borderSide: const BorderSide(
-                            color: Color(0xFF3A3A3A)),
+                        borderSide: BorderSide(
+                          color: isOver
+                              ? const Color(0xFFFF453A)
+                              : const Color(0xFF3A3A3A),
+                        ),
                       ),
                       enabledBorder: OutlineInputBorder(
                         borderRadius: BorderRadius.circular(8),
-                        borderSide: const BorderSide(
-                            color: Color(0xFF3A3A3A)),
+                        borderSide: BorderSide(
+                          color: isOver
+                              ? const Color(0xFFFF453A)
+                              : const Color(0xFF3A3A3A),
+                        ),
                       ),
                       focusedBorder: OutlineInputBorder(
                         borderRadius: BorderRadius.circular(8),
-                        borderSide: const BorderSide(
-                            color: Color(0xFF76C442)),
+                        borderSide: BorderSide(
+                          color: isOver
+                              ? const Color(0xFFFF453A)
+                              : const Color(0xFF76C442),
+                        ),
                       ),
                     ),
                   ),
                 )
               else
-                const SizedBox(width: 80),
+                const SizedBox(width: 90),
             ],
           ),
-          // 동일 이름 후보 선택
-          if (entry.candidates.length > 1 && entry.included)
+          // 보유량 초과 경고
+          if (entry.included && isOver)
             Padding(
-              padding: const EdgeInsets.only(left: 44, top: 6),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text('어떤 것을 사용했나요?',
-                      style: TextStyle(
-                          fontSize: 11, color: Color(0xFF7A7A7A))),
-                  const SizedBox(height: 6),
-                  Wrap(
-                    spacing: 6,
-                    runSpacing: 4,
-                    children: List.generate(
-                      entry.candidates.length,
-                      (ci) {
-                        final cand = entry.candidates[ci];
-                        final cDays =
-                            ExpiryUtils.daysUntil(cand.expiryDate);
-                        final isSelected = ci == entry.selectedIndex;
-                        return GestureDetector(
-                          onTap: () =>
-                              setState(() => entry.selectedIndex = ci),
-                          child: Container(
-                            padding: const EdgeInsets.symmetric(
-                                horizontal: 10, vertical: 5),
-                            decoration: BoxDecoration(
-                              color: isSelected
-                                  ? const Color(0xFF76C442)
-                                      .withValues(alpha: 0.18)
-                                  : const Color(0xFF252525),
-                              borderRadius: BorderRadius.circular(8),
-                              border: Border.all(
-                                color: isSelected
-                                    ? const Color(0xFF76C442)
-                                    : const Color(0xFF3A3A3A),
-                              ),
-                            ),
-                            child: Text(
-                              cDays != null
-                                  ? 'D${cDays <= 0 ? cDays : '+$cDays'} · ${cand.quantity ?? '?'}${cand.unit ?? ''}'
-                                  : '만료일 없음 · ${cand.quantity ?? '?'}${cand.unit ?? ''}',
-                              style: TextStyle(
-                                fontSize: 11,
-                                fontWeight: isSelected
-                                    ? FontWeight.bold
-                                    : FontWeight.normal,
-                                color: isSelected
-                                    ? const Color(0xFF76C442)
-                                    : const Color(0xFF7A7A7A),
-                              ),
-                            ),
-                          ),
-                        );
-                      },
-                    ),
-                  ),
-                ],
+              padding: const EdgeInsets.only(left: 44, top: 4),
+              child: Text(
+                '보유량($qtyStr${c.unit ?? ''})을 초과했어요',
+                style: const TextStyle(
+                    fontSize: 11, color: Color(0xFFFF453A)),
               ),
             ),
           if (widget.entries.last != entry)
             const Divider(
-                height: 16, indent: 44, color: Color(0xFF222222)),
+                height: 16,
+                indent: 44,
+                color: Color(0xFF222222)),
         ],
       ),
     );

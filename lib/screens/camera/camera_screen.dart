@@ -1,9 +1,13 @@
 import 'dart:io';
+import 'dart:math' as math;
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:intl/intl.dart';
 import '../../services/openai_service.dart';
 import '../../services/ingredient_service.dart';
+import '../../services/storage_service.dart';
+import '../../services/animation_settings.dart';
 import '../../utils/expiry_utils.dart';
 import '../ingredients/ingredient_form_screen.dart';
 
@@ -20,12 +24,14 @@ class _CameraScreenState extends State<CameraScreen> {
   final _picker = ImagePicker();
   final _openAI = OpenAIService();
   final _ingredientSvc = IngredientService();
+  final _storage = StorageService();
 
   File? _image;
   List<Map<String, dynamic>>? _recognized;
   List<bool> _selected = [];
   bool _isAnalyzing = false;
   bool _isSaving = false;
+  bool _isSingleIngredient = false;
 
   _ScanMode _mode = _ScanMode.fridge;
   DateTime _purchaseDate = DateTime.now();
@@ -41,6 +47,7 @@ class _CameraScreenState extends State<CameraScreen> {
       _image = null;
       _recognized = null;
       _selected = [];
+      _isSingleIngredient = false;
     });
   }
 
@@ -74,17 +81,28 @@ class _CameraScreenState extends State<CameraScreen> {
     setState(() => _isAnalyzing = true);
     try {
       final bytes = await _image!.readAsBytes();
-      final result = _isReceiptMode
-          ? await _openAI.extractReceiptIngredients(
-              bytes,
-              purchaseDate: _purchaseDate,
-            )
-          : await _openAI.recognizeIngredients(bytes);
-
-      setState(() {
-        _recognized = result;
-        _selected = List.filled(result.length, true);
-      });
+      if (_isReceiptMode) {
+        final items = await _openAI.extractReceiptIngredients(
+          bytes,
+          purchaseDate: _purchaseDate,
+        );
+        setState(() {
+          _isSingleIngredient = false;
+          _recognized = items;
+          _selected = List.filled(items.length, true);
+        });
+      } else {
+        final result = await _openAI.recognizeIngredients(bytes);
+        debugPrint('[CameraScreen] singleIngredient=${result.singleIngredient}, 아이템=${result.items.length}개');
+        for (final item in result.items) {
+          debugPrint('[CameraScreen] 아이템: ${item['name']} / expiry_date: ${item['expiry_date']}');
+        }
+        setState(() {
+          _isSingleIngredient = result.singleIngredient;
+          _recognized = result.items;
+          _selected = List.filled(result.items.length, true);
+        });
+      }
     } catch (e) {
       _showSnack('인식 실패: $e', error: true);
     } finally {
@@ -127,7 +145,26 @@ class _CameraScreenState extends State<CameraScreen> {
 
     setState(() => _isSaving = true);
     try {
+      // 냉장고 촬영 + 1종류 식재료면 사진을 Storage에 업로드
+      String? uploadedImageUrl;
+      if (!_isReceiptMode && _isSingleIngredient && _image != null) {
+        debugPrint('[CameraScreen] single_ingredient=true → 이미지 업로드 시작');
+        final bytes = await _image!.readAsBytes();
+        uploadedImageUrl = await _storage.uploadIngredientImage(bytes);
+        debugPrint('[CameraScreen] 업로드 완료: $uploadedImageUrl');
+      } else {
+        debugPrint('[CameraScreen] 이미지 업로드 skip: isReceipt=$_isReceiptMode, isSingle=$_isSingleIngredient');
+      }
+
       for (final item in toSave) {
+        final expiryStr = item['expiry_date']?.toString();
+        final hasExpiry = expiryStr != null &&
+            expiryStr.isNotEmpty &&
+            expiryStr != 'null';
+        final storageTypeStr = item['storage_type']?.toString();
+        final hasStorageType = storageTypeStr != null &&
+            storageTypeStr.isNotEmpty &&
+            storageTypeStr != 'null';
         await _ingredientSvc.addIngredient({
           'name': item['name'],
           if (item['quantity'] != null && item['quantity'].toString() != 'null')
@@ -137,10 +174,9 @@ class _CameraScreenState extends State<CameraScreen> {
           if (item['unit'] != null && item['unit'].toString() != 'null')
             'unit': item['unit'].toString(),
           if (item['category'] != null) 'category': item['category'],
-          // Receipt mode includes expiry date
-          if (item['expiry_date'] != null &&
-              item['expiry_date'].toString().isNotEmpty)
-            'expiry_date': item['expiry_date'],
+          if (hasExpiry) 'expiry_date': expiryStr,
+          if (hasStorageType) 'storage_type': storageTypeStr,
+          'image_url': ?uploadedImageUrl,
         });
       }
       if (mounted) {
@@ -377,51 +413,60 @@ class _CameraScreenState extends State<CameraScreen> {
 
   Widget _buildImageArea() {
     if (_image != null) {
-      return Stack(
+      return ConstrainedBox(
+        constraints: const BoxConstraints(maxHeight: 480),
+        child: Stack(
         children: [
           ClipRRect(
             borderRadius: BorderRadius.circular(18),
-            child: Image.file(
-              _image!,
+            child: Container(
               width: double.infinity,
-              height: 260,
-              fit: BoxFit.cover,
+              color: const Color(0xFF111111),
+              child: Image.file(
+                _image!,
+                width: double.infinity,
+                fit: BoxFit.contain,
+              ),
             ),
           ),
           if (_isAnalyzing)
             Positioned.fill(
-              child: Container(
-                decoration: BoxDecoration(
-                  color: Colors.black.withValues(alpha: 0.72),
-                  borderRadius: BorderRadius.circular(18),
-                ),
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    const CircularProgressIndicator(
-                        color: Color(0xFF76C442)),
-                    const SizedBox(height: 16),
-                    Text(
-                      _isReceiptMode
-                          ? 'AI가 영수증을 분석하는 중...'
-                          : 'AI가 식재료를 인식하는 중...',
-                      style: const TextStyle(
-                          color: Colors.white, fontSize: 15),
-                    ),
-                    if (_isReceiptMode)
-                      const Padding(
-                        padding: EdgeInsets.only(top: 6),
-                        child: Text(
-                          '비식품 항목은 자동으로 제외됩니다',
-                          style: TextStyle(
-                              color: Color(0xFF9A9A9A), fontSize: 12),
-                        ),
+              child: AnimationSettings().isEnabled
+                  ? _SparkleOverlay(isReceiptMode: _isReceiptMode)
+                  : Container(
+                      decoration: BoxDecoration(
+                        color: Colors.black.withValues(alpha: 0.72),
+                        borderRadius: BorderRadius.circular(18),
                       ),
-                  ],
-                ),
-              ),
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          const CircularProgressIndicator(
+                              color: Color(0xFF76C442)),
+                          const SizedBox(height: 16),
+                          Text(
+                            _isReceiptMode
+                                ? 'AI가 영수증을 분석하는 중...'
+                                : 'AI가 식재료를 인식하는 중...',
+                            style: const TextStyle(
+                                color: Colors.white, fontSize: 15),
+                          ),
+                          if (_isReceiptMode)
+                            const Padding(
+                              padding: EdgeInsets.only(top: 6),
+                              child: Text(
+                                '비식품 항목은 자동으로 제외됩니다',
+                                style: TextStyle(
+                                    color: Color(0xFF9A9A9A),
+                                    fontSize: 12),
+                              ),
+                            ),
+                        ],
+                      ),
+                    ),
             ),
         ],
+        ),
       );
     }
 
@@ -593,6 +638,33 @@ class _CameraScreenState extends State<CameraScreen> {
                   ],
                 ),
               ),
+            ] else if (_recognized?.any((item) {
+                    final e = item['expiry_date']?.toString();
+                    return e != null && e.isNotEmpty && e != 'null';
+                  }) ==
+                true) ...[
+              const SizedBox(width: 8),
+              Container(
+                padding: const EdgeInsets.symmetric(
+                    horizontal: 8, vertical: 3),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF76C442).withValues(alpha: 0.1),
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: const Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.auto_awesome,
+                        size: 10, color: Color(0xFF76C442)),
+                    SizedBox(width: 3),
+                    Text('유통기한 자동 인식',
+                        style: TextStyle(
+                            fontSize: 10,
+                            color: Color(0xFF76C442),
+                            fontWeight: FontWeight.w600)),
+                  ],
+                ),
+              ),
             ],
             const Spacer(),
             GestureDetector(
@@ -631,10 +703,12 @@ class _CameraScreenState extends State<CameraScreen> {
     final unit = item['unit'];
     final cat = item['category'];
     final expiryStr = item['expiry_date']?.toString();
-    final expiryDate = (expiryStr != null && expiryStr.isNotEmpty)
+    final expiryDate = (expiryStr != null && expiryStr.isNotEmpty && expiryStr != 'null')
         ? DateTime.tryParse(expiryStr)
         : null;
     final days = ExpiryUtils.daysUntil(expiryDate);
+    final storageStr = item['storage_type']?.toString();
+    final reasonStr = item['reason']?.toString();
 
     return GestureDetector(
       onTap: () => setState(() => _selected[i] = !_selected[i]),
@@ -687,7 +761,7 @@ class _CameraScreenState extends State<CameraScreen> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  // Name + category
+                  // Name + category + storage
                   Row(
                     children: [
                       Expanded(
@@ -717,6 +791,25 @@ class _CameraScreenState extends State<CameraScreen> {
                             ),
                           ),
                         ),
+                      if (!_isReceiptMode &&
+                          storageStr != null &&
+                          storageStr.isNotEmpty &&
+                          storageStr != 'null') ...[
+                        const SizedBox(width: 4),
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 6, vertical: 2),
+                          decoration: BoxDecoration(
+                            color: _storageColor(storageStr)
+                                .withValues(alpha: 0.15),
+                            borderRadius: BorderRadius.circular(6),
+                          ),
+                          child: Text(
+                            _storageEmoji(storageStr),
+                            style: const TextStyle(fontSize: 11),
+                          ),
+                        ),
+                      ],
                     ],
                   ),
                   const SizedBox(height: 5),
@@ -727,7 +820,7 @@ class _CameraScreenState extends State<CameraScreen> {
                       style: const TextStyle(
                           color: Color(0xFF9A9A9A), fontSize: 12),
                     ),
-                  // Expiry row (receipt mode)
+                  // Expiry row
                   if (expiryDate != null && days != null) ...[
                     const SizedBox(height: 4),
                     Row(
@@ -765,13 +858,57 @@ class _CameraScreenState extends State<CameraScreen> {
                           ),
                         ),
                         const SizedBox(width: 4),
-                        Text(
-                          '(${item['estimated_shelf_days']}일)',
-                          style: const TextStyle(
-                              fontSize: 10,
-                              color: Color(0xFF5A5A5A)),
-                        ),
+                        if (_isReceiptMode)
+                          Text(
+                            '(${item['estimated_shelf_days']}일)',
+                            style: const TextStyle(
+                                fontSize: 10,
+                                color: Color(0xFF5A5A5A)),
+                          )
+                        else
+                          Container(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 5, vertical: 1),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFF76C442)
+                                  .withValues(alpha: 0.12),
+                              borderRadius: BorderRadius.circular(4),
+                            ),
+                            child: const Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(Icons.auto_awesome,
+                                    size: 8,
+                                    color: Color(0xFF76C442)),
+                                SizedBox(width: 2),
+                                Text(
+                                  'AI 인식',
+                                  style: TextStyle(
+                                      fontSize: 9,
+                                      color: Color(0xFF76C442),
+                                      fontWeight: FontWeight.w600),
+                                ),
+                              ],
+                            ),
+                          ),
                       ],
+                    ),
+                  ],
+                  // Reason (AI 인식 근거)
+                  if (!_isReceiptMode &&
+                      reasonStr != null &&
+                      reasonStr.isNotEmpty &&
+                      reasonStr != 'null') ...[
+                    const SizedBox(height: 5),
+                    Text(
+                      '근거: $reasonStr',
+                      style: const TextStyle(
+                        fontSize: 11,
+                        color: Color(0xFF5A5A5A),
+                        fontStyle: FontStyle.italic,
+                      ),
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
                     ),
                   ],
                 ],
@@ -860,5 +997,182 @@ class _CameraScreenState extends State<CameraScreen> {
       case '음료': return const Color(0xFF26C6DA);
       default: return const Color(0xFF78909C);
     }
+  }
+
+  Color _storageColor(String storage) {
+    switch (storage) {
+      case '냉장': return const Color(0xFF42A5F5);
+      case '냉동': return const Color(0xFF90CAF9);
+      case '상온': return const Color(0xFFFF9F0A);
+      default: return const Color(0xFF9A9A9A);
+    }
+  }
+
+  String _storageEmoji(String storage) {
+    switch (storage) {
+      case '냉장': return '🧊';
+      case '냉동': return '❄️';
+      case '상온': return '🌡️';
+      default: return storage;
+    }
+  }
+}
+
+// ── _SparkleOverlay ────────────────────────────────────────────────────────────
+
+class _SparkleOverlay extends StatefulWidget {
+  final bool isReceiptMode;
+
+  const _SparkleOverlay({required this.isReceiptMode});
+
+  @override
+  State<_SparkleOverlay> createState() => _SparkleOverlayState();
+}
+
+class _SparkleOverlayState extends State<_SparkleOverlay>
+    with TickerProviderStateMixin {
+  late AnimationController _rotCtrl;
+  late AnimationController _rotCtrl2;
+  late AnimationController _pulseCtrl;
+
+  @override
+  void initState() {
+    super.initState();
+    _rotCtrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 2000),
+    )..repeat();
+    _rotCtrl2 = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 2800),
+    )..repeat();
+    _pulseCtrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 900),
+    )..repeat(reverse: true);
+  }
+
+  @override
+  void dispose() {
+    _rotCtrl.dispose();
+    _rotCtrl2.dispose();
+    _pulseCtrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.72),
+        borderRadius: BorderRadius.circular(18),
+      ),
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          SizedBox(
+            width: 90,
+            height: 90,
+            child: Stack(
+              alignment: Alignment.center,
+              children: [
+                RotationTransition(
+                  turns: _rotCtrl,
+                  child: _SparkleRing(
+                    radius: 36,
+                    count: 5,
+                    color: const Color(0xFF76C442),
+                    dotSize: 7,
+                  ),
+                ),
+                RotationTransition(
+                  turns: Tween(begin: 0.0, end: -1.0).animate(_rotCtrl2),
+                  child: _SparkleRing(
+                    radius: 22,
+                    count: 3,
+                    color: const Color(0xFFFF9F0A),
+                    dotSize: 5,
+                  ),
+                ),
+                AnimatedBuilder(
+                  animation: _pulseCtrl,
+                  builder: (_, __) => Text(
+                    '✨',
+                    style: TextStyle(fontSize: 22 + _pulseCtrl.value * 6),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 18),
+          Text(
+            widget.isReceiptMode
+                ? 'AI가 영수증을 분석하는 중...'
+                : 'AI가 식재료를 인식하는 중...',
+            style: const TextStyle(color: Colors.white, fontSize: 15),
+          ),
+          if (widget.isReceiptMode)
+            const Padding(
+              padding: EdgeInsets.only(top: 6),
+              child: Text(
+                '비식품 항목은 자동으로 제외됩니다',
+                style: TextStyle(color: Color(0xFF9A9A9A), fontSize: 12),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class _SparkleRing extends StatelessWidget {
+  final double radius;
+  final int count;
+  final Color color;
+  final double dotSize;
+
+  const _SparkleRing({
+    required this.radius,
+    required this.count,
+    required this.color,
+    required this.dotSize,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final total = radius * 2 + dotSize;
+    return SizedBox(
+      width: total,
+      height: total,
+      child: Stack(
+        children: List.generate(count, (i) {
+          final angle = (i / count) * 2 * math.pi;
+          final cx = (radius + dotSize / 2) +
+              radius * math.cos(angle) -
+              dotSize / 2;
+          final cy = (radius + dotSize / 2) +
+              radius * math.sin(angle) -
+              dotSize / 2;
+          return Positioned(
+            left: cx,
+            top: cy,
+            child: Container(
+              width: dotSize,
+              height: dotSize,
+              decoration: BoxDecoration(
+                color: color,
+                shape: BoxShape.circle,
+                boxShadow: [
+                  BoxShadow(
+                    color: color.withValues(alpha: 0.7),
+                    blurRadius: 5,
+                  ),
+                ],
+              ),
+            ),
+          );
+        }),
+      ),
+    );
   }
 }

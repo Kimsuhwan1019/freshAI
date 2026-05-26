@@ -7,6 +7,8 @@ class Ingredient {
   final String? category;
   final DateTime? expiryDate;
   final DateTime createdAt;
+  final String? imageUrl;
+  final String? storageType; // 냉장/냉동/상온
 
   const Ingredient({
     required this.id,
@@ -17,6 +19,8 @@ class Ingredient {
     this.category,
     this.expiryDate,
     required this.createdAt,
+    this.imageUrl,
+    this.storageType,
   });
 
   factory Ingredient.fromJson(Map<String, dynamic> json) {
@@ -33,6 +37,8 @@ class Ingredient {
           ? DateTime.parse(json['expiry_date'] as String)
           : null,
       createdAt: DateTime.parse(json['created_at'] as String),
+      imageUrl: json['image_url'] as String?,
+      storageType: json['storage_type'] as String?,
     );
   }
 
@@ -45,6 +51,8 @@ class Ingredient {
       if (category != null) 'category': category,
       if (expiryDate != null)
         'expiry_date': expiryDate!.toIso8601String().split('T')[0],
+      if (imageUrl != null) 'image_url': imageUrl,
+      if (storageType != null) 'storage_type': storageType,
     };
   }
 }

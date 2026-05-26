@@ -1,8 +1,15 @@
 import 'dart:convert';
 import 'dart:typed_data';
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:intl/intl.dart';
 import '../config.dart';
+
+class RecognitionResult {
+  final bool singleIngredient;
+  final List<Map<String, dynamic>> items;
+  const RecognitionResult({required this.singleIngredient, required this.items});
+}
 
 class OpenAIService {
   static final OpenAIService _instance = OpenAIService._internal();
@@ -16,7 +23,7 @@ class OpenAIService {
 
   // ── 냉장고 촬영 → 식재료 인식 ────────────────────────────────
 
-  Future<List<Map<String, dynamic>>> recognizeIngredients(
+  Future<RecognitionResult> recognizeIngredients(
       Uint8List imageBytes) async {
     if (!hasApiKey) throw Exception('OpenAI API 키가 설정되지 않았습니다');
 
@@ -37,10 +44,17 @@ class OpenAIService {
               {
                 'type': 'text',
                 'text':
-                    '이 냉장고 사진에서 보이는 모든 식재료를 인식하고 JSON 배열로만 반환하세요.\n'
-                    '각 항목 형식: {"name":"식재료명","quantity":수량또는null,"unit":"단위또는null","category":"카테고리"}\n'
+                    '이 사진에서 식재료를 분석해 아래 JSON 형식으로만 반환하세요.\n'
+                    '{"single_ingredient": true/false, "items": [{"name":"핵심식재료명","quantity":수량또는null,"unit":"단위또는null","category":"카테고리","expiry_date":"YYYY-MM-DD 또는 null","storage_type":"냉장/냉동/상온","reason":"인식근거"}]}\n'
+                    '- name: 핵심 식재료명만 (형용사·수식어·원산지 제거: "국내산 유기농 계란"→"계란", "냉동 손질 오징어"→"오징어", "간편 깐 대파"→"대파")\n'
+                    '- single_ingredient: 식재료 종류가 딱 1가지만 보이면 true (같은 종류 여러 개도 true), 2종류 이상이면 false\n'
+                    '- expiry_date: 패키지/라벨에 유통기한·소비기한·Best Before 표시가 있으면 반드시 "YYYY-MM-DD" 형식으로 변환\n'
+                    '  인식 가능 형식 예시: "2026.04.28"→"2026-04-28", "26.04.28"→"2026-04-28", "26년 4월 28일까지"→"2026-04-28"\n'
+                    '  유통기한이 없거나 안 보이면 null\n'
+                    '- storage_type: 냉장/냉동/상온 중 하나 (채소·육류·어류·계란·유제품→냉장, 아이스크림·냉동식품→냉동, 감자·양파·마늘·라면·조미료·통조림→상온)\n'
+                    '- reason: 이 식재료로 판단한 근거 30자 이내 (형태·색상·패키지 텍스트 등)\n'
                     '카테고리: 채소, 과일, 육류, 어류, 유제품, 곡류, 조미료, 음료, 기타 중 하나\n'
-                    '반드시 순수 JSON 배열만 반환하고 다른 텍스트는 포함하지 마세요.',
+                    '순수 JSON 객체만 반환하고 다른 텍스트는 포함하지 마세요.',
               },
               {
                 'type': 'image_url',
@@ -65,10 +79,67 @@ class OpenAIService {
 
     final result = jsonDecode(utf8.decode(response.bodyBytes));
     final content = result['choices'][0]['message']['content'] as String;
+    debugPrint('[OpenAI 냉장고] 원본 응답: $content');
+
     final cleaned =
         content.replaceAll('```json', '').replaceAll('```', '').trim();
-    final List<dynamic> items = jsonDecode(cleaned);
-    return items.cast<Map<String, dynamic>>();
+    final Map<String, dynamic> parsed = jsonDecode(cleaned);
+    final single = parsed['single_ingredient'] == true;
+    final List<dynamic> rawItems = parsed['items'] as List? ?? [];
+    final items = rawItems.cast<Map<String, dynamic>>().map((item) {
+      final expiryRaw = item['expiry_date']?.toString();
+      final normalizedExpiry =
+          (expiryRaw != null && expiryRaw != 'null' && expiryRaw.isNotEmpty)
+              ? _normalizeExpiryDate(expiryRaw)
+              : null;
+      return {
+        ...item,
+        if (normalizedExpiry != null) 'expiry_date': normalizedExpiry,
+        if (normalizedExpiry == null) 'expiry_date': null,
+      };
+    }).toList();
+
+    debugPrint('[OpenAI 냉장고] single_ingredient: $single, 아이템 수: ${items.length}');
+    for (final item in items) {
+      debugPrint('[OpenAI 냉장고] → ${item['name']} / 유통기한: ${item['expiry_date']} / 보관: ${item['storage_type']} / 근거: ${item['reason']}');
+    }
+
+    return RecognitionResult(
+      singleIngredient: single,
+      items: items,
+    );
+  }
+
+  // 다양한 유통기한 형식 → YYYY-MM-DD 정규화
+  String? _normalizeExpiryDate(String raw) {
+    // 이미 YYYY-MM-DD 형식
+    final isoMatch = RegExp(r'^(\d{4})-(\d{2})-(\d{2})$').firstMatch(raw);
+    if (isoMatch != null) return raw;
+
+    // YYYY.MM.DD
+    final dotFull = RegExp(r'^(\d{4})\.(\d{1,2})\.(\d{1,2})$').firstMatch(raw);
+    if (dotFull != null) {
+      return '${dotFull[1]!}-${dotFull[2]!.padLeft(2, '0')}-${dotFull[3]!.padLeft(2, '0')}';
+    }
+
+    // YY.MM.DD or YY-MM-DD
+    final dotShort =
+        RegExp(r'^(\d{2})[.\-](\d{1,2})[.\-](\d{1,2})$').firstMatch(raw);
+    if (dotShort != null) {
+      final year = '20${dotShort[1]!}';
+      return '$year-${dotShort[2]!.padLeft(2, '0')}-${dotShort[3]!.padLeft(2, '0')}';
+    }
+
+    // 26년 4월 28일
+    final korean =
+        RegExp(r'(\d{2,4})년\s*(\d{1,2})월\s*(\d{1,2})일').firstMatch(raw);
+    if (korean != null) {
+      final y = korean[1]!.length == 2 ? '20${korean[1]!}' : korean[1]!;
+      return '$y-${korean[2]!.padLeft(2, '0')}-${korean[3]!.padLeft(2, '0')}';
+    }
+
+    // GPT가 이미 변환했으면 그대로 반환, 아니면 null
+    return null;
   }
 
   // ── 영수증 스캔 → 식재료 + 유통기한 추정 ──────────────────────

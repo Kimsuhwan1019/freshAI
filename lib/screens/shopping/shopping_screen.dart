@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
@@ -6,6 +7,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 import '../../config.dart';
 import '../../services/ingredient_service.dart';
+import '../../services/animation_settings.dart';
 
 // ── Data models ────────────────────────────────────────────────────────────────
 
@@ -31,20 +33,18 @@ class _PlaceResult {
   final String address;
   final double lat;
   final double lng;
-  final bool? isOpen;
   final double distance;
+  final bool? isOpen;
   final String? todayHours;
-  final List<String> types;
 
   const _PlaceResult({
     required this.name,
     required this.address,
     required this.lat,
     required this.lng,
-    required this.isOpen,
     required this.distance,
+    this.isOpen,
     this.todayHours,
-    this.types = const <String>[],
   });
 }
 
@@ -65,28 +65,82 @@ class _ShoppingScreenState extends State<ShoppingScreen>
   static const _kBorder = Color(0xFF2A2A2A);
   static const _kBlue = Color(0xFF5B9BD5);
 
-  static const _martBrands = [
+  // ── Brand / filter constants ───────────────────────────────────────────────
+
+  // 마트 탭: 이름에 포함되면 표시 (contains 방식)
+  static const _martKeywords = [
     '이마트', '홈플러스', '롯데마트', '코스트코',
     '하나로마트', '농협마트', 'GS더프레시', '노브랜드',
-    '메가마트', '킴스클럽', '탑마트',
+    '메가마트', '킴스클럽', '탑마트', '슈퍼마켓', '슈퍼', '마트',
   ];
+  // 편의점 탭: 시작 일치 방식 유지
   static const _cvsBrands = [
     'CU', 'GS25', '세븐일레븐', '이마트24', '미니스톱', '씨스페이스',
   ];
+  // 마트 탭 제외 키워드
+  static const _martExclude = [
+    'CU', 'GS25', '세븐일레븐', '이마트24', '미니스톱',
+    '편의점', '컴퓨터', '의류', '패션', '카페', '음식점', '버거', '치킨',
+  ];
+  // 편의점 탭 제외 키워드
+  static const _cvsExclude = [
+    '컴퓨터', '의류', '패션', '카페', '음식점', '버거', '치킨',
+  ];
 
-  /// 브랜드명이 매장명 맨 앞에 있는지 확인
+  // 브랜드명이 매장명 맨 앞에 있는지 확인 (편의점 탭 전용)
   static bool _startsWithBrand(String name, String brand) {
     if (!name.startsWith(brand)) return false;
-    final rest = name.substring(brand.length);
-    // 정확히 브랜드명만 있거나 뒤에 공백이 오는 경우 (예: "홈플러스 인하점")
-    if (rest.isEmpty || rest.startsWith(' ')) return true;
-    // "이마트24"는 편의점 → 마트 탭 제외
-    if (brand == '이마트' && rest.startsWith('24')) return false;
-    // "노브랜드버거" 제외 (한글 자모가 바로 붙는 경우)
-    if (brand == '노브랜드' && !RegExp(r'^[\d\s]').hasMatch(rest)) return false;
-    // 숫자로 시작 (지점 번호 등), 한글 복합어(이마트트레이더스 등)
-    // → types 필터가 잘못된 매장 차단
-    return true;
+    if (name.length == brand.length) return true;
+    final after = name.substring(brand.length);
+    return after.startsWith(' ') || RegExp(r'^[가-힣\d]').hasMatch(after);
+  }
+
+  // 마트 탭: 이름에 마트 키워드 포함 여부 (contains)
+  static bool _isValidMart(String name) {
+    if (_martExclude.any(name.contains)) return false;
+    return _martKeywords.any(name.contains);
+  }
+
+  // 편의점 탭: CVS 브랜드로 시작하는지 확인 (startsWith)
+  static bool _isValidCVS(String name) {
+    if (_cvsExclude.any(name.contains)) return false;
+    return _cvsBrands.any((b) => _startsWithBrand(name, b));
+  }
+
+  // 브랜드별 표준 영업시간 추정 (카카오 공개 API는 영업시간 미제공)
+  static ({bool? isOpen, String? todayHours}) _estimateHours(String name) {
+    // 편의점: 대부분 24시간
+    if (_cvsBrands.any((b) => _startsWithBrand(name, b))) {
+      return (isOpen: true, todayHours: '24시간');
+    }
+    // 마트별 표준 영업시간 — contains 방식으로 검사
+    const martHours = <String, (int, int)>{
+      '이마트':    (10, 23), '홈플러스':   (10, 23),
+      '롯데마트':  (10, 23), '코스트코':   (10, 21),
+      '메가마트':  (10, 22), 'GS더프레시': (9,  22),
+      '농협마트':  (9,  21), '하나로마트': (9,  21),
+      '킴스클럽':  (10, 22), '탑마트':    (9,  22),
+      '노브랜드':  (10, 22),
+    };
+    for (final e in martHours.entries) {
+      if (!name.contains(e.key)) continue;
+      // 이마트24 → 편의점이므로 건너뜀
+      if (e.key == '이마트' && name.contains('이마트24')) continue;
+      return _calcHours(e.value.$1, e.value.$2);
+    }
+    // 브랜드 미매칭 → 일반 마트/슈퍼마켓 기본 시간
+    if (name.contains('마트') || name.contains('슈퍼')) {
+      return _calcHours(9, 22);
+    }
+    return (isOpen: null, todayHours: null);
+  }
+
+  static ({bool isOpen, String todayHours}) _calcHours(int openH, int closeH) {
+    final h = DateTime.now().hour;
+    final isOpen = h >= openH && h < closeH;
+    final label = '${openH.toString().padLeft(2, '0')}:00'
+        '~${closeH.toString().padLeft(2, '0')}:00';
+    return (isOpen: isOpen, todayHours: label);
   }
 
   // Shopping list
@@ -107,6 +161,7 @@ class _ShoppingScreenState extends State<ShoppingScreen>
   @override
   void initState() {
     super.initState();
+    AnimationSettings().load();
     _tabController = TabController(length: 2, vsync: this)
       ..addListener(() {
         if (!_tabController.indexIsChanging) {
@@ -265,7 +320,7 @@ class _ShoppingScreenState extends State<ShoppingScreen>
       _storeError = null;
     });
     try {
-      final results = await _fetchPlaces(tab);
+      final results = await _fetchKakaoPlaces(tab);
       if (!mounted) return;
       setState(() {
         if (tab == 0) {
@@ -275,10 +330,10 @@ class _ShoppingScreenState extends State<ShoppingScreen>
         }
         _loadingStores = false;
       });
-    } catch (_) {
+    } catch (e) {
       if (!mounted) return;
       setState(() {
-        _storeError = '매장 정보를 불러올 수 없어요.';
+        _storeError = e.toString().replaceFirst('Exception: ', '');
         _loadingStores = false;
       });
     }
@@ -295,150 +350,251 @@ class _ShoppingScreenState extends State<ShoppingScreen>
     await _loadStoresForCurrentTab(forceRefresh: true);
   }
 
-  Future<List<_PlaceResult>> _fetchPlaces(int tabIndex) async {
+  Future<List<_PlaceResult>> _fetchKakaoPlaces(int tabIndex) async {
     final lat = _position!.latitude;
     final lng = _position!.longitude;
 
-    final brands = tabIndex == 0 ? _martBrands : _cvsBrands;
-
-    debugPrint('[Places] 위치: $lat,$lng | 탭: $tabIndex | 브랜드: $brands');
-
-    // 한 번에 최대 4개씩 병렬 요청 (연결 풀 포화 방지)
-    const batchSize = 4;
-    final allLists = <List<_PlaceResult>>[];
-    for (var i = 0; i < brands.length; i += batchSize) {
-      final batch = brands.skip(i).take(batchSize).toList();
-      final results =
-          await Future.wait(batch.map((kw) => _fetchByKeyword(lat, lng, kw)));
-      allLists.addAll(results);
-    }
-
-    // 마트/편의점 허용 타입
-    const martTypes = {'supermarket', 'grocery_or_supermarket'};
-    const cvsTypes = {'convenience_store'};
-    final allowedTypes = tabIndex == 0 ? martTypes : cvsTypes;
+    // 마트 탭: 마트 + 슈퍼마켓, 편의점 탭: 편의점
+    final keywords = tabIndex == 0 ? ['마트', '슈퍼마켓'] : ['편의점'];
 
     final seen = <String>{};
     final combined = <_PlaceResult>[];
-    for (final list in allLists) {
-      for (final place in list) {
-        // [1] 브랜드명이 이름 맨 앞에 있는 매장만 허용
-        if (!brands.any((b) => _startsWithBrand(place.name, b))) continue;
-        // [2] types 정보가 있으면 허용 타입인지 검증
-        if (place.types.isNotEmpty &&
-            !place.types.any(allowedTypes.contains)) {
-          continue;
-        }
-        // [3] 중복 제거
+    for (final keyword in keywords) {
+      final results = await _fetchKakaoByKeyword(lat, lng, keyword);
+      for (final place in results) {
+        // 브랜드 필터링
+        final valid = tabIndex == 0
+            ? _isValidMart(place.name)
+            : _isValidCVS(place.name);
+        if (!valid) continue;
         final key = '${place.name}|${place.address}';
-        if (seen.add(key)) combined.add(place);
-      }
-    }
-    combined.sort((a, b) => a.distance.compareTo(b.distance));
-    debugPrint('[Places] 최종 ${combined.length}건');
-    return combined;
-  }
-
-  Future<List<_PlaceResult>> _fetchByKeyword(
-      double lat, double lng, String keyword) async {
-    try {
-      // Places API (New) - Text Search
-      final uri = Uri.parse(
-          'https://places.googleapis.com/v1/places:searchText');
-      final res = await http
-          .post(
-            uri,
-            headers: {
-              'Content-Type': 'application/json',
-              'X-Goog-Api-Key': AppConfig.googleMapsApiKey,
-              'X-Goog-FieldMask':
-                  'places.displayName,places.shortFormattedAddress,'
-                  'places.location,places.currentOpeningHours,'
-                  'places.regularOpeningHours,places.types',
-            },
-            body: json.encode({
-              'textQuery': keyword,
-              'locationBias': {
-                'circle': {
-                  'center': {'latitude': lat, 'longitude': lng},
-                  'radius': 3000.0,
-                }
-              },
-              'maxResultCount': 20,
-              'languageCode': 'ko',
-            }),
-          )
-          .timeout(const Duration(seconds: 10));
-
-      final data = json.decode(res.body) as Map<String, dynamic>;
-      if (res.statusCode != 200) {
-        debugPrint(
-            '[Places] "$keyword" → HTTP ${res.statusCode}: '
-            '${data['error']?['message']}');
-        return [];
-      }
-
-      final list = data['places'] as List? ?? [];
-      debugPrint('[Places] "$keyword" → ${list.length}건');
-
-      return list.map((r) {
-        final rlat =
-            (r['location']['latitude'] as num).toDouble();
-        final rlng =
-            (r['location']['longitude'] as num).toDouble();
-        final isOpen =
-            r['currentOpeningHours']?['openNow'] as bool?;
-        // 오늘 영업시간 파싱 (regularOpeningHours 우선, 없으면 current)
-        final hours = r['regularOpeningHours']
-                ?? r['currentOpeningHours'];
-        String? todayHours;
-        final descriptions =
-            hours?['weekdayDescriptions'] as List?;
-        if (descriptions != null && descriptions.isNotEmpty) {
-          // weekday: 1=월 ~ 7=일, descriptions[0]=월 ~ [6]=일
-          final idx = DateTime.now().weekday - 1;
-          if (idx < descriptions.length) {
-            final desc = descriptions[idx] as String;
-            final colon = desc.indexOf(': ');
-            todayHours =
-                colon >= 0 ? desc.substring(colon + 2) : desc;
-          }
-        }
-        final types = (r['types'] as List?)
-                ?.map((t) => t as String)
-                .toList() ??
-            <String>[];
-        return _PlaceResult(
-          name: r['displayName']?['text'] as String? ?? '',
-          address:
-              r['shortFormattedAddress'] as String? ?? '',
-          lat: rlat,
-          lng: rlng,
+        if (!seen.add(key)) continue;
+        // 브랜드별 영업시간 추정
+        final (:isOpen, :todayHours) = _estimateHours(place.name);
+        combined.add(_PlaceResult(
+          name: place.name,
+          address: place.address,
+          lat: place.lat,
+          lng: place.lng,
+          distance: place.distance,
           isOpen: isOpen,
-          distance:
-              Geolocator.distanceBetween(lat, lng, rlat, rlng),
           todayHours: todayHours,
-          types: types,
-        );
-      }).toList();
-    } catch (e) {
-      debugPrint('[Places] "$keyword" 실패: $e');
-      return [];
+        ));
+      }
     }
+
+    combined.sort((a, b) => a.distance.compareTo(b.distance));
+    final filtered = combined.where((p) => p.distance <= 3000).toList();
+    debugPrint('[Kakao] 최종 ${filtered.length}건 (3km 이내)');
+    return filtered;
   }
 
-  Future<void> _openInMaps(_PlaceResult place) async {
+  Future<List<_PlaceResult>> _fetchKakaoByKeyword(
+      double lat, double lng, String keyword) async {
+    // 카카오 로컬 API: x=경도, y=위도
     final uri = Uri.parse(
-      'https://www.google.com/maps/dir/?api=1'
-      '&destination=${place.lat},${place.lng}'
-      '&travelmode=transit',
-    );
-    if (!await launchUrl(uri, mode: LaunchMode.externalApplication)) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('지도 앱을 열 수 없어요')),
-        );
+      'https://dapi.kakao.com/v2/local/search/keyword.json',
+    ).replace(queryParameters: {
+      'query': keyword,
+      'x': lng.toString(),
+      'y': lat.toString(),
+      'radius': '3000',
+      'size': '15',
+      'sort': 'distance',
+    });
+
+    debugPrint('[Kakao] 요청: ${uri.toString()}');
+
+    final res = await http.get(
+      uri,
+      headers: {
+        'Authorization': 'KakaoAK ${AppConfig.kakaoRestApiKey}',
+      },
+    ).timeout(const Duration(seconds: 10));
+
+    debugPrint('[Kakao] "$keyword" → HTTP ${res.statusCode}');
+
+    if (res.statusCode != 200) {
+      final body = utf8.decode(res.bodyBytes);
+      debugPrint('[Kakao] 오류 응답: $body');
+      // 오류 메시지를 파싱해서 예외로 던짐
+      try {
+        final err = json.decode(body) as Map<String, dynamic>;
+        final msg = err['message'] as String? ?? '알 수 없는 오류';
+        throw Exception('카카오 API 오류: $msg (HTTP ${res.statusCode})');
+      } catch (parseErr) {
+        if (parseErr is Exception) rethrow;
+        throw Exception('카카오 API 오류 (HTTP ${res.statusCode})');
       }
+    }
+
+    final data =
+        json.decode(utf8.decode(res.bodyBytes)) as Map<String, dynamic>;
+    final documents = data['documents'] as List? ?? [];
+    debugPrint('[Kakao] "$keyword" → ${documents.length}건 원본:');
+    for (final d in documents) {
+      debugPrint('  · ${d['place_name']} / ${d['category_name']} / ${d['distance']}m');
+    }
+
+    return documents.map((d) {
+      final dist =
+          double.tryParse(d['distance'] as String? ?? '0') ?? 0.0;
+      final placeLat =
+          double.tryParse(d['y'] as String? ?? '') ?? 0.0;
+      final placeLng =
+          double.tryParse(d['x'] as String? ?? '') ?? 0.0;
+      final roadAddr = d['road_address_name'] as String? ?? '';
+      final addr = d['address_name'] as String? ?? '';
+      return _PlaceResult(
+        name: d['place_name'] as String? ?? '',
+        address: roadAddr.isNotEmpty ? roadAddr : addr,
+        lat: placeLat,
+        lng: placeLng,
+        distance: dist,
+      );
+    }).toList();
+  }
+
+  void _showTravelModeSheet(_PlaceResult place) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF1A1A1A),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (_) => Padding(
+        padding: const EdgeInsets.fromLTRB(20, 20, 20, 36),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(children: [
+              const Icon(Icons.store_rounded, color: _kBlue, size: 20),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  place.name,
+                  style: const TextStyle(
+                      fontWeight: FontWeight.bold, fontSize: 15),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              Text(
+                _fmtDist(place.distance),
+                style: const TextStyle(
+                    color: Color(0xFF7A7A7A), fontSize: 13),
+              ),
+            ]),
+            const SizedBox(height: 4),
+            Padding(
+              padding: const EdgeInsets.only(left: 30),
+              child: Text(
+                place.address,
+                style: const TextStyle(
+                    color: Color(0xFF7A7A7A), fontSize: 12),
+              ),
+            ),
+            const SizedBox(height: 18),
+            const Text(
+              '경로 안내 방법 선택',
+              style: TextStyle(
+                  color: Color(0xFF9A9A9A),
+                  fontSize: 11,
+                  letterSpacing: 0.5),
+            ),
+            const SizedBox(height: 10),
+            _travelModeRow(
+                Icons.directions_walk_rounded, '도보', 'FOOT', place),
+            const SizedBox(height: 8),
+            _travelModeRow(
+                Icons.directions_car_rounded, '자동차', 'CAR', place),
+            const SizedBox(height: 8),
+            _travelModeRow(
+                Icons.directions_transit_rounded, '대중교통', 'PUBLICTRANSIT', place),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _travelModeRow(
+      IconData icon, String label, String mode, _PlaceResult place) {
+    return GestureDetector(
+      onTap: () {
+        Navigator.pop(context);
+        _openInKakaoMaps(place, mode);
+      },
+      child: Container(
+        padding:
+            const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+        decoration: BoxDecoration(
+          color: const Color(0xFF252525),
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: const Color(0xFF2E2E2E)),
+        ),
+        child: Row(
+          children: [
+            Icon(icon, color: _kBlue, size: 22),
+            const SizedBox(width: 14),
+            Expanded(
+              child: Text(label,
+                  style: const TextStyle(
+                      fontSize: 15, fontWeight: FontWeight.w500)),
+            ),
+            const Icon(Icons.open_in_new_rounded,
+                color: Color(0xFF5A5A5A), size: 16),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _openInKakaoMaps(_PlaceResult place, String kakaoMode) async {
+    final userLat = _position?.latitude ?? 0;
+    final userLng = _position?.longitude ?? 0;
+
+    // 카카오맵 앱 딥링크 (sp=출발지, ep=목적지, by=이동수단)
+    final kakaoUri = Uri.parse(
+      'kakaomap://route?sp=$userLat,$userLng'
+      '&ep=${place.lat},${place.lng}'
+      '&by=$kakaoMode',
+    );
+
+    if (await canLaunchUrl(kakaoUri)) {
+      await launchUrl(kakaoUri, mode: LaunchMode.externalApplication);
+      return;
+    }
+
+    // 카카오맵 미설치 → Play Store로 이동
+    if (!mounted) return;
+    final install = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        backgroundColor: const Color(0xFF1A1A1A),
+        title: const Text('카카오맵 필요'),
+        content: const Text('카카오맵이 설치되어 있지 않습니다.\nPlay 스토어에서 설치하시겠습니까?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('취소',
+                style: TextStyle(color: Color(0xFF9A9A9A))),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('설치하기',
+                style: TextStyle(
+                    color: Color(0xFF5B9BD5),
+                    fontWeight: FontWeight.bold)),
+          ),
+        ],
+      ),
+    );
+
+    if (install == true) {
+      final storeUri = Uri.parse(
+        'https://play.google.com/store/apps/details?id=net.daum.android.map',
+      );
+      await launchUrl(storeUri, mode: LaunchMode.externalApplication);
     }
   }
 
@@ -528,7 +684,7 @@ class _ShoppingScreenState extends State<ShoppingScreen>
               child: Center(child: CircularProgressIndicator()),
             )
           else ...[
-            if (_allChecked) _buildCompleteBanner(),
+            if (_allChecked) const _ConfettiBanner(),
             if (_items.isNotEmpty)
               _buildItemsList()
             else if (!_showAddField)
@@ -610,42 +766,6 @@ class _ShoppingScreenState extends State<ShoppingScreen>
                 size: 18,
               ),
             ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildCompleteBanner() {
-    return Container(
-      margin: const EdgeInsets.fromLTRB(16, 12, 16, 4),
-      padding: const EdgeInsets.symmetric(vertical: 16),
-      decoration: BoxDecoration(
-        gradient: LinearGradient(colors: [
-          _kPrimary.withValues(alpha: 0.15),
-          _kPrimary.withValues(alpha: 0.05),
-        ]),
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: _kPrimary.withValues(alpha: 0.3)),
-      ),
-      child: const Row(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          Text('🎉', style: TextStyle(fontSize: 22)),
-          SizedBox(width: 10),
-          Text(
-            '쇼핑 완료!',
-            style: TextStyle(
-              fontWeight: FontWeight.bold,
-              fontSize: 17,
-              color: _kPrimary,
-              letterSpacing: -0.3,
-            ),
-          ),
-          SizedBox(width: 6),
-          Text(
-            '모든 항목을 구매했어요',
-            style: TextStyle(color: Color(0xFF5A9A30), fontSize: 13),
           ),
         ],
       ),
@@ -944,7 +1064,7 @@ class _ShoppingScreenState extends State<ShoppingScreen>
           const Divider(height: 1, indent: 72, color: Color(0xFF222222)),
       itemBuilder: (context, i) => _StoreTile(
         place: stores[i],
-        onTap: () => _openInMaps(stores[i]),
+        onTap: () => _showTravelModeSheet(stores[i]),
         fmtDist: _fmtDist,
       ),
     );
@@ -953,7 +1073,7 @@ class _ShoppingScreenState extends State<ShoppingScreen>
 
 // ── _ShoppingItemRow ───────────────────────────────────────────────────────────
 
-class _ShoppingItemRow extends StatelessWidget {
+class _ShoppingItemRow extends StatefulWidget {
   final _ShoppingItem item;
   final VoidCallback onToggle;
   final VoidCallback onDelete;
@@ -964,52 +1084,95 @@ class _ShoppingItemRow extends StatelessWidget {
     required this.onDelete,
   });
 
+  @override
+  State<_ShoppingItemRow> createState() => _ShoppingItemRowState();
+}
+
+class _ShoppingItemRowState extends State<_ShoppingItemRow>
+    with SingleTickerProviderStateMixin {
   static const _kPrimary = Color(0xFF76C442);
+
+  late AnimationController _bounceCtrl;
+  late Animation<double> _bounceAnim;
+
+  @override
+  void initState() {
+    super.initState();
+    _bounceCtrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 380),
+    );
+    _bounceAnim = TweenSequence<double>([
+      TweenSequenceItem(tween: Tween(begin: 1.0, end: 1.45), weight: 25),
+      TweenSequenceItem(tween: Tween(begin: 1.45, end: 0.85), weight: 30),
+      TweenSequenceItem(tween: Tween(begin: 0.85, end: 1.12), weight: 25),
+      TweenSequenceItem(tween: Tween(begin: 1.12, end: 1.0), weight: 20),
+    ]).animate(CurvedAnimation(parent: _bounceCtrl, curve: Curves.easeOut));
+  }
+
+  @override
+  void dispose() {
+    _bounceCtrl.dispose();
+    super.dispose();
+  }
+
+  void _handleTap() {
+    if (AnimationSettings().isEnabled) _bounceCtrl.forward(from: 0);
+    widget.onToggle();
+  }
 
   @override
   Widget build(BuildContext context) {
     return InkWell(
-      onTap: onToggle,
+      onTap: _handleTap,
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 13),
         child: Row(
           children: [
-            AnimatedContainer(
-              duration: const Duration(milliseconds: 150),
-              width: 22,
-              height: 22,
-              decoration: BoxDecoration(
-                color: item.checked ? _kPrimary : Colors.transparent,
-                border: Border.all(
-                  color:
-                      item.checked ? _kPrimary : const Color(0xFF4A4A4A),
-                  width: 1.5,
-                ),
-                borderRadius: BorderRadius.circular(6),
+            AnimatedBuilder(
+              animation: _bounceAnim,
+              builder: (_, child) => Transform.scale(
+                scale: _bounceAnim.value,
+                child: child,
               ),
-              child: item.checked
-                  ? const Icon(Icons.check_rounded,
-                      color: Colors.black, size: 14)
-                  : null,
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 150),
+                width: 22,
+                height: 22,
+                decoration: BoxDecoration(
+                  color: widget.item.checked ? _kPrimary : Colors.transparent,
+                  border: Border.all(
+                    color: widget.item.checked
+                        ? _kPrimary
+                        : const Color(0xFF4A4A4A),
+                    width: 1.5,
+                  ),
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: widget.item.checked
+                    ? const Icon(Icons.check_rounded,
+                        color: Colors.black, size: 14)
+                    : null,
+              ),
             ),
             const SizedBox(width: 12),
             Expanded(
               child: Text(
-                item.name,
+                widget.item.name,
                 style: TextStyle(
                   fontSize: 15,
                   fontWeight: FontWeight.w500,
-                  color: item.checked
+                  color: widget.item.checked
                       ? const Color(0xFF5A5A5A)
                       : Colors.white,
-                  decoration: item.checked
+                  decoration: widget.item.checked
                       ? TextDecoration.lineThrough
                       : TextDecoration.none,
                   decorationColor: const Color(0xFF5A5A5A),
                 ),
               ),
             ),
-            if (item.isAuto)
+            if (widget.item.isAuto)
               Container(
                 margin: const EdgeInsets.only(right: 8),
                 padding:
@@ -1017,7 +1180,8 @@ class _ShoppingItemRow extends StatelessWidget {
                 decoration: BoxDecoration(
                   color: _kPrimary.withValues(alpha: 0.1),
                   borderRadius: BorderRadius.circular(6),
-                  border: Border.all(color: _kPrimary.withValues(alpha: 0.3)),
+                  border:
+                      Border.all(color: _kPrimary.withValues(alpha: 0.3)),
                 ),
                 child: const Text(
                   '자동',
@@ -1030,7 +1194,7 @@ class _ShoppingItemRow extends StatelessWidget {
                 ),
               ),
             GestureDetector(
-              onTap: onDelete,
+              onTap: widget.onDelete,
               child: const Icon(Icons.close_rounded,
                   color: Color(0xFF4A4A4A), size: 18),
             ),
@@ -1039,6 +1203,141 @@ class _ShoppingItemRow extends StatelessWidget {
       ),
     );
   }
+}
+
+// ── _ConfettiBanner ────────────────────────────────────────────────────────────
+
+class _ConfettiBanner extends StatefulWidget {
+  const _ConfettiBanner();
+
+  @override
+  State<_ConfettiBanner> createState() => _ConfettiBannerState();
+}
+
+class _ConfettiBannerState extends State<_ConfettiBanner>
+    with SingleTickerProviderStateMixin {
+  static const _kPrimary = Color(0xFF76C442);
+
+  late AnimationController _ctrl;
+
+  @override
+  void initState() {
+    super.initState();
+    _ctrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1800),
+    )..repeat();
+  }
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+      height: 76,
+      decoration: BoxDecoration(
+        gradient: LinearGradient(colors: [
+          _kPrimary.withValues(alpha: 0.15),
+          _kPrimary.withValues(alpha: 0.05),
+        ]),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: _kPrimary.withValues(alpha: 0.3)),
+      ),
+      child: Stack(
+        children: [
+          if (AnimationSettings().isEnabled)
+            Positioned.fill(
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(14),
+                child: AnimatedBuilder(
+                  animation: _ctrl,
+                  builder: (_, __) => CustomPaint(
+                    painter: _ConfettiPainter(_ctrl.value),
+                  ),
+                ),
+              ),
+            ),
+          const Center(
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Text('🎉', style: TextStyle(fontSize: 22)),
+                SizedBox(width: 10),
+                Text(
+                  '쇼핑 완료!',
+                  style: TextStyle(
+                    fontWeight: FontWeight.bold,
+                    fontSize: 17,
+                    color: _kPrimary,
+                    letterSpacing: -0.3,
+                  ),
+                ),
+                SizedBox(width: 6),
+                Text(
+                  '모든 항목을 구매했어요',
+                  style: TextStyle(color: Color(0xFF5A9A30), fontSize: 13),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ConfettiPainter extends CustomPainter {
+  final double progress;
+
+  _ConfettiPainter(this.progress);
+
+  static final _particles = List.generate(22, (i) {
+    final r = math.Random(i * 11 + 7);
+    return (
+      x: r.nextDouble(),
+      y: r.nextDouble(),
+      speed: 0.25 + r.nextDouble() * 0.65,
+      size: 4.0 + r.nextDouble() * 5.0,
+      angle: r.nextDouble() * math.pi * 2,
+      colorIdx: i % 5,
+    );
+  });
+
+  static const _colors = [
+    Color(0xFF76C442),
+    Color(0xFFFF9F0A),
+    Color(0xFF42A5F5),
+    Color(0xFFFF453A),
+    Colors.white,
+  ];
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    for (final p in _particles) {
+      final y = ((p.y + progress * p.speed) % 1.0) * size.height;
+      final x = p.x * size.width;
+      final paint = Paint()
+        ..color = _colors[p.colorIdx].withValues(alpha: 0.65)
+        ..style = PaintingStyle.fill;
+      canvas.save();
+      canvas.translate(x, y);
+      canvas.rotate(p.angle + progress * math.pi * 3);
+      canvas.drawRect(
+        Rect.fromCenter(
+            center: Offset.zero, width: p.size, height: p.size * 0.5),
+        paint,
+      );
+      canvas.restore();
+    }
+  }
+
+  @override
+  bool shouldRepaint(_ConfettiPainter old) => old.progress != progress;
 }
 
 // ── _StoreTile ─────────────────────────────────────────────────────────────────
@@ -1056,7 +1355,6 @@ class _StoreTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final isOpen = place.isOpen;
     return InkWell(
       onTap: onTap,
       child: Padding(
@@ -1095,12 +1393,25 @@ class _StoreTile extends StatelessWidget {
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                   ),
+                  if (place.todayHours != null) ...[
+                    const SizedBox(height: 3),
+                    Text(
+                      place.todayHours!,
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: place.isOpen == true
+                            ? const Color(0xFF76C442)
+                            : const Color(0xFF9A9A9A),
+                      ),
+                    ),
+                  ],
                 ],
               ),
             ),
             const SizedBox(width: 8),
             Column(
               crossAxisAlignment: CrossAxisAlignment.end,
+              mainAxisAlignment: MainAxisAlignment.center,
               children: [
                 Text(
                   fmtDist(place.distance),
@@ -1110,43 +1421,29 @@ class _StoreTile extends StatelessWidget {
                     color: Color(0xFFB0B0B0),
                   ),
                 ),
-                const SizedBox(height: 4),
-                if (isOpen != null)
+                if (place.isOpen != null) ...[
+                  const SizedBox(height: 4),
                   Container(
                     padding: const EdgeInsets.symmetric(
                         horizontal: 7, vertical: 2),
                     decoration: BoxDecoration(
-                      color: isOpen
-                          ? const Color(0xFF76C442)
-                              .withValues(alpha: 0.12)
-                          : const Color(0xFFFF453A)
-                              .withValues(alpha: 0.12),
+                      color: place.isOpen!
+                          ? const Color(0xFF76C442).withValues(alpha: 0.12)
+                          : const Color(0xFFFF453A).withValues(alpha: 0.12),
                       borderRadius: BorderRadius.circular(5),
                     ),
                     child: Text(
-                      isOpen ? '영업중' : '영업종료',
+                      place.isOpen! ? '영업중' : '영업종료',
                       style: TextStyle(
                         fontSize: 10,
                         fontWeight: FontWeight.bold,
-                        color: isOpen
+                        color: place.isOpen!
                             ? const Color(0xFF76C442)
                             : const Color(0xFFFF453A),
                       ),
                     ),
-                  )
-                else
-                  const Text(
-                    '영업시간 정보 없음',
-                    style: TextStyle(
-                        fontSize: 10, color: Color(0xFF5A5A5A)),
                   ),
-                const SizedBox(height: 3),
-                Text(
-                  place.todayHours ?? '영업시간 정보 없음',
-                  style: const TextStyle(
-                      fontSize: 10, color: Color(0xFF7A7A7A)),
-                  textAlign: TextAlign.end,
-                ),
+                ],
               ],
             ),
             const SizedBox(width: 4),

@@ -4,6 +4,7 @@ import 'package:cached_network_image/cached_network_image.dart';
 import '../../models/ingredient.dart';
 import '../../services/ingredient_service.dart';
 import '../../services/unsplash_service.dart';
+import '../../services/animation_settings.dart';
 import '../../utils/expiry_utils.dart';
 import 'ingredient_form_screen.dart';
 
@@ -14,28 +15,41 @@ class IngredientsScreen extends StatefulWidget {
   State<IngredientsScreen> createState() => _IngredientsScreenState();
 }
 
-class _IngredientsScreenState extends State<IngredientsScreen> {
+class _IngredientsScreenState extends State<IngredientsScreen>
+    with SingleTickerProviderStateMixin {
   final _service = IngredientService();
   List<Ingredient> _ingredients = [];
   bool _isLoading = true;
   String _searchQuery = '';
-  String? _selectedCategory;
+  String? _selectedStorageType;
 
-  static const _categories = [
-    '전체', '채소', '과일', '육류', '어류', '유제품', '곡류', '조미료', '음료', '기타'
-  ];
+  late AnimationController _entranceCtrl;
 
   @override
   void initState() {
     super.initState();
+    AnimationSettings().load();
+    _entranceCtrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 700),
+    );
     _load();
+  }
+
+  @override
+  void dispose() {
+    _entranceCtrl.dispose();
+    super.dispose();
   }
 
   Future<void> _load() async {
     setState(() => _isLoading = true);
     try {
       final data = await _service.getIngredients();
-      if (mounted) setState(() => _ingredients = data);
+      if (mounted) {
+        setState(() => _ingredients = data);
+        _entranceCtrl.forward(from: 0);
+      }
     } catch (e) {
       if (mounted) _showSnack('불러오기 실패: $e', error: true);
     } finally {
@@ -68,10 +82,27 @@ class _IngredientsScreenState extends State<IngredientsScreen> {
     return _ingredients.where((i) {
       final matchSearch =
           i.name.toLowerCase().contains(_searchQuery.toLowerCase());
-      final matchCat = _selectedCategory == null ||
-          _selectedCategory == '전체' ||
-          i.category == _selectedCategory;
-      return matchSearch && matchCat;
+      final matchStorage =
+          _selectedStorageType == null || i.storageType == _selectedStorageType;
+      return matchSearch && matchStorage;
+    }).toList();
+  }
+
+  // 같은 이름의 식재료를 병합한 리스트 (유통기한 빠른 순 정렬)
+  List<_MergedIngredient> get _mergedFiltered {
+    final grouped = <String, List<Ingredient>>{};
+    for (final ing in _filtered) {
+      grouped.putIfAbsent(ing.name, () => []).add(ing);
+    }
+    return grouped.entries.map((e) {
+      final sorted = List<Ingredient>.from(e.value)
+        ..sort((a, b) {
+          if (a.expiryDate == null && b.expiryDate == null) return 0;
+          if (a.expiryDate == null) return 1;
+          if (b.expiryDate == null) return -1;
+          return a.expiryDate!.compareTo(b.expiryDate!);
+        });
+      return _MergedIngredient(name: e.key, items: sorted);
     }).toList();
   }
 
@@ -102,7 +133,7 @@ class _IngredientsScreenState extends State<IngredientsScreen> {
         slivers: [
           _buildSliverAppBar(expiredCount),
           SliverToBoxAdapter(child: _buildSearchBar()),
-          SliverToBoxAdapter(child: _buildCategoryChips()),
+          SliverToBoxAdapter(child: _buildStorageFilter()),
           if (!_isLoading)
             SliverToBoxAdapter(child: _buildStatsRow(expiredCount)),
           _isLoading
@@ -112,7 +143,7 @@ class _IngredientsScreenState extends State<IngredientsScreen> {
                         color: Color(0xFF76C442)),
                   ),
                 )
-              : _filtered.isEmpty
+              : _mergedFiltered.isEmpty
                   ? SliverFillRemaining(child: _emptyState())
                   : SliverPadding(
                       padding:
@@ -126,8 +157,30 @@ class _IngredientsScreenState extends State<IngredientsScreen> {
                           childAspectRatio: 0.82,
                         ),
                         delegate: SliverChildBuilderDelegate(
-                          (_, i) => _ingredientCard(_filtered[i]),
-                          childCount: _filtered.length,
+                          (_, i) {
+                            final card = _ingredientCard(_mergedFiltered[i]);
+                            if (!AnimationSettings().isEnabled) return card;
+                            final start = (i * 0.06).clamp(0.0, 0.65);
+                            final end = (start + 0.4).clamp(0.1, 1.0);
+                            final interval = Interval(start, end,
+                                curve: Curves.easeOutCubic);
+                            return FadeTransition(
+                              opacity: _entranceCtrl.drive(
+                                Tween(begin: 0.0, end: 1.0)
+                                    .chain(CurveTween(curve: interval)),
+                              ),
+                              child: SlideTransition(
+                                position: _entranceCtrl.drive(
+                                  Tween(
+                                    begin: const Offset(0, 0.25),
+                                    end: Offset.zero,
+                                  ).chain(CurveTween(curve: interval)),
+                                ),
+                                child: card,
+                              ),
+                            );
+                          },
+                          childCount: _mergedFiltered.length,
                         ),
                       ),
                     ),
@@ -217,41 +270,40 @@ class _IngredientsScreenState extends State<IngredientsScreen> {
     );
   }
 
-  Widget _buildCategoryChips() {
+  Widget _buildStorageFilter() {
+    const types = [
+      (null, '전체'),
+      ('냉장', '🧊 냉장'),
+      ('냉동', '❄️ 냉동'),
+      ('상온', '🌡️ 상온'),
+    ];
     return SizedBox(
-      height: 52,
-      child: ListView.builder(
+      height: 48,
+      child: ListView(
         scrollDirection: Axis.horizontal,
-        padding: const EdgeInsets.symmetric(
-            horizontal: 14, vertical: 8),
-        itemCount: _categories.length,
-        itemBuilder: (_, i) {
-          final cat = _categories[i];
-          final selected = _selectedCategory == cat ||
-              (_selectedCategory == null && cat == '전체');
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+        children: types.map((t) {
+          final (value, label) = t;
+          final selected = _selectedStorageType == value;
+          final color = _storageColor(value);
           return Padding(
             padding: const EdgeInsets.only(right: 8),
             child: GestureDetector(
-              onTap: () => setState(() {
-                _selectedCategory = cat == '전체' ? null : cat;
-              }),
+              onTap: () =>
+                  setState(() => _selectedStorageType = value),
               child: AnimatedContainer(
                 duration: const Duration(milliseconds: 200),
                 padding: const EdgeInsets.symmetric(
                     horizontal: 14, vertical: 6),
                 decoration: BoxDecoration(
-                  color: selected
-                      ? const Color(0xFF76C442)
-                      : const Color(0xFF252525),
+                  color: selected ? color : const Color(0xFF252525),
                   borderRadius: BorderRadius.circular(20),
                   border: Border.all(
-                    color: selected
-                        ? const Color(0xFF76C442)
-                        : const Color(0xFF2A2A2A),
+                    color: selected ? color : const Color(0xFF2A2A2A),
                   ),
                 ),
                 child: Text(
-                  cat,
+                  label,
                   style: TextStyle(
                     fontSize: 12,
                     fontWeight: FontWeight.w600,
@@ -263,9 +315,18 @@ class _IngredientsScreenState extends State<IngredientsScreen> {
               ),
             ),
           );
-        },
+        }).toList(),
       ),
     );
+  }
+
+  Color _storageColor(String? type) {
+    switch (type) {
+      case '냉장': return const Color(0xFF42A5F5);
+      case '냉동': return const Color(0xFF90CAF9);
+      case '상온': return const Color(0xFFFF9F0A);
+      default: return const Color(0xFF76C442);
+    }
   }
 
   Widget _buildStatsRow(int expiredCount) {
@@ -361,22 +422,68 @@ class _IngredientsScreenState extends State<IngredientsScreen> {
     );
   }
 
-  Widget _ingredientCard(Ingredient item) {
-    final days = ExpiryUtils.daysUntil(item.expiryDate);
+  void _showIngredientDetailSheet(_MergedIngredient merged) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      isScrollControlled: true,
+      builder: (_) => _IngredientDetailSheet(
+        merged: merged,
+        catColor: _catColor(merged.category),
+        onEdit: (item) async {
+          Navigator.pop(context);
+          final ok = await Navigator.push<bool>(
+            context,
+            MaterialPageRoute(
+                builder: (_) => IngredientFormScreen(ingredient: item)),
+          );
+          if (ok == true && mounted) _load();
+        },
+        onDelete: (item) {
+          Navigator.pop(context);
+          _confirmDelete(item);
+        },
+        onAddNew: () {
+          Navigator.pop(context);
+          Navigator.push<bool>(
+            context,
+            MaterialPageRoute(builder: (_) => const IngredientFormScreen()),
+          ).then((ok) {
+            if (ok == true && mounted) _load();
+          });
+        },
+      ),
+    );
+  }
+
+  Widget _ingredientCard(_MergedIngredient merged) {
+    final days = merged.earliestDays;
     final expired = days != null && days <= 0;
     final soon = days != null && days >= 1 && days <= 3;
-    final catColor = _catColor(item.category);
+    final catColor = _catColor(merged.category);
 
-    return GestureDetector(
-      onTap: () async {
-        final ok = await Navigator.push<bool>(
-          context,
-          MaterialPageRoute(
-              builder: (_) => IngredientFormScreen(ingredient: item)),
-        );
-        if (ok == true) _load();
+    final card = GestureDetector(
+      onTap: () {
+        if (merged.hasMultiple) {
+          _showIngredientDetailSheet(merged);
+        } else {
+          Navigator.push<bool>(
+            context,
+            MaterialPageRoute(
+                builder: (_) =>
+                    IngredientFormScreen(ingredient: merged.items.first)),
+          ).then((ok) {
+            if (ok == true && mounted) _load();
+          });
+        }
       },
-      onLongPress: () => _confirmDelete(item),
+      onLongPress: () {
+        if (merged.hasMultiple) {
+          _showIngredientDetailSheet(merged);
+        } else {
+          _confirmDelete(merged.items.first);
+        }
+      },
       child: Container(
         decoration: BoxDecoration(
           color: const Color(0xFF1A1A1A),
@@ -400,11 +507,38 @@ class _IngredientsScreenState extends State<IngredientsScreen> {
                 borderRadius: const BorderRadius.vertical(
                     top: Radius.circular(17)),
                 child: FutureBuilder<String?>(
-                  future: UnsplashService.getImageUrl(
-                    item.name,
-                    category: item.category,
-                  ),
+                  future: merged.imageUrl != null
+                      ? Future.value(merged.imageUrl)
+                      : UnsplashService.getImageUrl(
+                          merged.name,
+                          category: merged.category,
+                        ),
                   builder: (ctx, snap) {
+                    final countBadge = merged.hasMultiple
+                        ? Positioned(
+                            top: 8,
+                            left: 8,
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 6, vertical: 3),
+                              decoration: BoxDecoration(
+                                color: Colors.black
+                                    .withValues(alpha: 0.55),
+                                borderRadius:
+                                    BorderRadius.circular(8),
+                              ),
+                              child: Text(
+                                '×${merged.items.length}',
+                                style: const TextStyle(
+                                  color: Color(0xFF76C442),
+                                  fontSize: 10,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            ),
+                          )
+                        : null;
+
                     if (snap.hasData && snap.data != null) {
                       return Stack(
                         fit: StackFit.expand,
@@ -438,10 +572,10 @@ class _IngredientsScreenState extends State<IngredientsScreen> {
                           ),
                           if (days != null)
                             Positioned(
-                              top: 8,
-                              right: 8,
-                              child: _expiryBadge(days),
-                            ),
+                                top: 8,
+                                right: 8,
+                                child: _expiryBadge(days)),
+                          ?countBadge,
                         ],
                       );
                     }
@@ -462,10 +596,10 @@ class _IngredientsScreenState extends State<IngredientsScreen> {
                           ),
                         if (days != null)
                           Positioned(
-                            top: 8,
-                            right: 8,
-                            child: _expiryBadge(days),
-                          ),
+                              top: 8,
+                              right: 8,
+                              child: _expiryBadge(days)),
+                        ?countBadge,
                       ],
                     );
                   },
@@ -482,7 +616,7 @@ class _IngredientsScreenState extends State<IngredientsScreen> {
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
                     Text(
-                      item.name,
+                      merged.name,
                       style: const TextStyle(
                         fontWeight: FontWeight.bold,
                         fontSize: 14,
@@ -496,33 +630,20 @@ class _IngredientsScreenState extends State<IngredientsScreen> {
                       mainAxisAlignment:
                           MainAxisAlignment.spaceBetween,
                       children: [
-                        if (item.category != null)
-                          Container(
-                            padding: const EdgeInsets.symmetric(
-                                horizontal: 7, vertical: 3),
-                            decoration: BoxDecoration(
-                              color: catColor.withValues(alpha: 0.15),
-                              borderRadius: BorderRadius.circular(6),
-                            ),
-                            child: Text(
-                              item.category!,
-                              style: TextStyle(
-                                fontSize: 10,
-                                color: catColor,
-                                fontWeight: FontWeight.w600,
-                              ),
-                            ),
-                          ),
-                        if (item.quantity != null)
+                        const SizedBox.shrink(),
+                        if (merged.totalQuantity != null)
                           Text(
-                            '${item.quantity!.toStringAsFixed(item.quantity! % 1 == 0 ? 0 : 1)}${item.unit ?? ''}',
+                            () {
+                              final q = merged.totalQuantity!;
+                              return '${q % 1 == 0 ? q.toInt() : q}${merged.unit ?? ''}';
+                            }(),
                             style: const TextStyle(
                                 color: Color(0xFF6A6A6A),
                                 fontSize: 11),
                           ),
                       ],
                     ),
-                    if (item.expiryDate != null)
+                    if (merged.items.any((i) => i.expiryDate != null))
                       Row(
                         children: [
                           Icon(
@@ -534,7 +655,12 @@ class _IngredientsScreenState extends State<IngredientsScreen> {
                           ),
                           const SizedBox(width: 3),
                           Text(
-                            DateFormat('MM.dd').format(item.expiryDate!),
+                            DateFormat('MM.dd').format(
+                              merged.items
+                                  .firstWhere(
+                                      (i) => i.expiryDate != null)
+                                  .expiryDate!,
+                            ),
                             style: TextStyle(
                               fontSize: 11,
                               color: days != null
@@ -566,6 +692,14 @@ class _IngredientsScreenState extends State<IngredientsScreen> {
         ),
       ),
     );
+
+    if (AnimationSettings().isEnabled && (expired || soon)) {
+      return _PulsingBorder(
+        color: expired ? const Color(0xFFFF453A) : const Color(0xFFFF9F0A),
+        child: card,
+      );
+    }
+    return card;
   }
 
   Widget _imagePlaceholder(Color catColor) {
@@ -633,6 +767,293 @@ class _IngredientsScreenState extends State<IngredientsScreen> {
           ),
         ],
       ),
+    );
+  }
+}
+
+// ── _PulsingBorder ─────────────────────────────────────────────────────────────
+
+class _PulsingBorder extends StatefulWidget {
+  final Widget child;
+  final Color color;
+
+  const _PulsingBorder({required this.child, required this.color});
+
+  @override
+  State<_PulsingBorder> createState() => _PulsingBorderState();
+}
+
+class _PulsingBorderState extends State<_PulsingBorder>
+    with SingleTickerProviderStateMixin {
+  late AnimationController _ctrl;
+  late Animation<double> _anim;
+
+  @override
+  void initState() {
+    super.initState();
+    _ctrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1400),
+    )..repeat(reverse: true);
+    _anim = CurvedAnimation(parent: _ctrl, curve: Curves.easeInOut);
+  }
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _anim,
+      builder: (_, child) => Container(
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(19),
+          boxShadow: [
+            BoxShadow(
+              color: widget.color.withValues(alpha: _anim.value * 0.55),
+              blurRadius: 10 + _anim.value * 8,
+              spreadRadius: _anim.value * 1.5,
+            ),
+          ],
+        ),
+        child: child,
+      ),
+      child: widget.child,
+    );
+  }
+}
+
+// ── _MergedIngredient ──────────────────────────────────────────────────────────
+
+class _MergedIngredient {
+  final String name;
+  final List<Ingredient> items; // 유통기한 빠른 순 정렬됨
+
+  const _MergedIngredient({required this.name, required this.items});
+
+  double? get totalQuantity {
+    if (items.every((i) => i.quantity == null)) return null;
+    return items.fold<double>(0, (s, i) => s + (i.quantity ?? 0));
+  }
+
+  String? get unit =>
+      items.firstWhere((i) => i.unit != null, orElse: () => items.first).unit;
+
+  String? get category => items
+      .firstWhere((i) => i.category != null, orElse: () => items.first)
+      .category;
+
+  int? get earliestDays {
+    final days = items
+        .map((i) => ExpiryUtils.daysUntil(i.expiryDate))
+        .whereType<int>()
+        .toList();
+    if (days.isEmpty) return null;
+    return days.reduce((a, b) => a < b ? a : b);
+  }
+
+  bool get hasMultiple => items.length > 1;
+
+  String? get imageUrl =>
+      items.firstWhere((i) => i.imageUrl != null, orElse: () => items.first).imageUrl;
+
+  String? get storageType =>
+      items.firstWhere((i) => i.storageType != null, orElse: () => items.first).storageType;
+}
+
+// ── _IngredientDetailSheet ─────────────────────────────────────────────────────
+
+class _IngredientDetailSheet extends StatelessWidget {
+  final _MergedIngredient merged;
+  final Color catColor;
+  final void Function(Ingredient) onEdit;
+  final void Function(Ingredient) onDelete;
+  final VoidCallback onAddNew;
+
+  const _IngredientDetailSheet({
+    required this.merged,
+    required this.catColor,
+    required this.onEdit,
+    required this.onDelete,
+    required this.onAddNew,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final total = merged.totalQuantity;
+    final totalStr = total == null
+        ? null
+        : '${total % 1 == 0 ? total.toInt() : total}${merged.unit ?? ''}';
+
+    return Container(
+      margin: const EdgeInsets.fromLTRB(12, 0, 12, 24),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1A1A1A),
+        borderRadius: BorderRadius.circular(24),
+        border: Border.all(color: const Color(0xFF2A2A2A)),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          // Handle
+          Container(
+            margin: const EdgeInsets.only(top: 12),
+            width: 36,
+            height: 4,
+            decoration: BoxDecoration(
+              color: const Color(0xFF3A3A3A),
+              borderRadius: BorderRadius.circular(2),
+            ),
+          ),
+          // Header
+          Padding(
+            padding: const EdgeInsets.fromLTRB(20, 14, 12, 12),
+            child: Row(
+              children: [
+                Container(
+                  width: 40,
+                  height: 40,
+                  decoration: BoxDecoration(
+                    color: catColor.withValues(alpha: 0.12),
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                  child: Icon(Icons.kitchen_rounded,
+                      color: catColor, size: 20),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        merged.name,
+                        style: const TextStyle(
+                            fontWeight: FontWeight.bold,
+                            fontSize: 17,
+                            letterSpacing: -0.3),
+                      ),
+                      if (totalStr != null)
+                        Text(
+                          '총 $totalStr · ${merged.items.length}종',
+                          style: const TextStyle(
+                              color: Color(0xFF7A7A7A), fontSize: 12),
+                        ),
+                    ],
+                  ),
+                ),
+                IconButton(
+                  onPressed: () => Navigator.pop(context),
+                  icon: const Icon(Icons.close_rounded,
+                      color: Color(0xFF6A6A6A), size: 20),
+                ),
+              ],
+            ),
+          ),
+          const Divider(height: 1, color: Color(0xFF252525)),
+          // Items
+          ...merged.items.map((item) => _itemRow(item)),
+          // Add new button
+          Padding(
+            padding: const EdgeInsets.fromLTRB(20, 8, 20, 16),
+            child: SizedBox(
+              width: double.infinity,
+              child: OutlinedButton.icon(
+                onPressed: onAddNew,
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: const Color(0xFF76C442),
+                  side: const BorderSide(color: Color(0xFF2E5C1A)),
+                  padding: const EdgeInsets.symmetric(vertical: 12),
+                  shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12)),
+                ),
+                icon: const Icon(Icons.add, size: 18),
+                label: const Text('추가 등록',
+                    style: TextStyle(fontWeight: FontWeight.bold)),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _itemRow(Ingredient item) {
+    final days = ExpiryUtils.daysUntil(item.expiryDate);
+    final expiryColor =
+        days != null ? ExpiryUtils.color(days) : null;
+
+    final qtyStr = item.quantity == null
+        ? '수량 미설정'
+        : '${item.quantity! % 1 == 0 ? item.quantity!.toInt() : item.quantity!}${item.unit ?? ''}';
+
+    return Column(
+      children: [
+        Padding(
+          padding:
+              const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+          child: Row(
+            children: [
+              Container(
+                width: 8,
+                height: 8,
+                decoration: BoxDecoration(
+                  color: days != null
+                      ? ExpiryUtils.color(days)
+                      : const Color(0xFF3A3A3A),
+                  shape: BoxShape.circle,
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(qtyStr,
+                        style: const TextStyle(
+                            fontWeight: FontWeight.w600, fontSize: 15)),
+                    if (item.expiryDate != null)
+                      Text(
+                        '유통기한 ${DateFormat('MM.dd').format(item.expiryDate!)}'
+                        '${days != null ? '  ${ExpiryUtils.label(days)}' : ''}',
+                        style: TextStyle(
+                            fontSize: 12,
+                            color: expiryColor ??
+                                const Color(0xFF7A7A7A)),
+                      )
+                    else
+                      const Text('유통기한 없음',
+                          style: TextStyle(
+                              fontSize: 12,
+                              color: Color(0xFF5A5A5A))),
+                  ],
+                ),
+              ),
+              IconButton(
+                onPressed: () => onEdit(item),
+                icon: const Icon(Icons.edit_outlined,
+                    size: 18, color: Color(0xFF7A7A7A)),
+                padding: EdgeInsets.zero,
+                constraints:
+                    const BoxConstraints(minWidth: 36, minHeight: 36),
+              ),
+              IconButton(
+                onPressed: () => onDelete(item),
+                icon: const Icon(Icons.delete_outline_rounded,
+                    size: 18, color: Color(0xFF5A5A5A)),
+                padding: EdgeInsets.zero,
+                constraints:
+                    const BoxConstraints(minWidth: 36, minHeight: 36),
+              ),
+            ],
+          ),
+        ),
+        if (merged.items.last != item)
+          const Divider(
+              height: 1, indent: 32, color: Color(0xFF252525)),
+      ],
     );
   }
 }

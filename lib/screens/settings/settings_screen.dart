@@ -1,10 +1,38 @@
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import '../../services/recipe_service.dart';
+import '../../services/animation_settings.dart';
 
-class SettingsScreen extends StatelessWidget {
+class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
 
-  Future<void> _signOut(BuildContext context) async {
+  @override
+  State<SettingsScreen> createState() => _SettingsScreenState();
+}
+
+class _SettingsScreenState extends State<SettingsScreen> {
+  bool _animEnabled = true;
+
+  @override
+  void initState() {
+    super.initState();
+    AnimationSettings().load().then((_) {
+      if (mounted) setState(() => _animEnabled = AnimationSettings().isEnabled);
+    });
+    AnimationSettings().enabled.addListener(_onAnimChanged);
+  }
+
+  @override
+  void dispose() {
+    AnimationSettings().enabled.removeListener(_onAnimChanged);
+    super.dispose();
+  }
+
+  void _onAnimChanged() {
+    if (mounted) setState(() => _animEnabled = AnimationSettings().isEnabled);
+  }
+
+  Future<void> _signOut() async {
     final ok = await showDialog<bool>(
       context: context,
       builder: (_) => AlertDialog(
@@ -26,7 +54,10 @@ class SettingsScreen extends StatelessWidget {
         ],
       ),
     );
-    if (ok == true) await Supabase.instance.client.auth.signOut();
+    if (ok == true) {
+      await RecipeService().clearLocalCache();
+      await Supabase.instance.client.auth.signOut();
+    }
   }
 
   @override
@@ -44,11 +75,15 @@ class SettingsScreen extends StatelessWidget {
         children: [
           _profileCard(email, initial),
           const SizedBox(height: 24),
+          _sectionLabel('화면'),
+          const SizedBox(height: 8),
+          _animCard(),
+          const SizedBox(height: 24),
           _sectionLabel('앱 정보'),
           const SizedBox(height: 8),
           _infoCard(),
           const SizedBox(height: 32),
-          _logoutButton(context),
+          _logoutButton(),
           const SizedBox(height: 40),
         ],
       ),
@@ -125,6 +160,53 @@ class SettingsScreen extends StatelessWidget {
             ),
           ),
         ],
+      ),
+    );
+  }
+
+  Widget _animCard() {
+    return Container(
+      decoration: BoxDecoration(
+        color: const Color(0xFF1A1A1A),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: const Color(0xFF2A2A2A)),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+        child: Row(
+          children: [
+            Container(
+              width: 30,
+              height: 30,
+              decoration: BoxDecoration(
+                color: const Color(0xFF76C442).withValues(alpha: 0.12),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: const Icon(Icons.animation,
+                  size: 16, color: Color(0xFF76C442)),
+            ),
+            const SizedBox(width: 12),
+            const Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('애니메이션 효과',
+                      style: TextStyle(
+                          fontWeight: FontWeight.w600, fontSize: 14)),
+                  Text('카드 등장, 반짝임, 버튼 효과 등',
+                      style: TextStyle(
+                          color: Color(0xFF6A6A6A), fontSize: 12)),
+                ],
+              ),
+            ),
+            Switch(
+              value: _animEnabled,
+              onChanged: (v) => AnimationSettings().setEnabled(v),
+              activeThumbColor: const Color(0xFF76C442),
+              activeTrackColor: const Color(0xFF76C442).withValues(alpha: 0.4),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -207,9 +289,9 @@ class SettingsScreen extends StatelessWidget {
     );
   }
 
-  Widget _logoutButton(BuildContext context) {
+  Widget _logoutButton() {
     return GestureDetector(
-      onTap: () => _signOut(context),
+      onTap: _signOut,
       child: Container(
         padding: const EdgeInsets.symmetric(vertical: 16),
         decoration: BoxDecoration(
@@ -221,7 +303,8 @@ class SettingsScreen extends StatelessWidget {
         child: const Row(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            Icon(Icons.logout_rounded, color: Color(0xFFFF453A), size: 20),
+            Icon(Icons.logout_rounded,
+                color: Color(0xFFFF453A), size: 20),
             SizedBox(width: 8),
             Text(
               '로그아웃',
