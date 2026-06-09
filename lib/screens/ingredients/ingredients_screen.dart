@@ -1,10 +1,14 @@
+import 'dart:async';
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:cached_network_image/cached_network_image.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 import '../../models/ingredient.dart';
 import '../../services/ingredient_service.dart';
 import '../../services/unsplash_service.dart';
 import '../../services/animation_settings.dart';
+import '../../utils/app_error.dart';
 import '../../utils/expiry_utils.dart';
 import 'ingredient_form_screen.dart';
 
@@ -20,10 +24,12 @@ class _IngredientsScreenState extends State<IngredientsScreen>
   final _service = IngredientService();
   List<Ingredient> _ingredients = [];
   bool _isLoading = true;
+  bool _hasNetworkError = false;
   String _searchQuery = '';
   String? _selectedStorageType;
 
   late AnimationController _entranceCtrl;
+  StreamSubscription<List<ConnectivityResult>>? _connectivitySub;
 
   @override
   void initState() {
@@ -34,16 +40,31 @@ class _IngredientsScreenState extends State<IngredientsScreen>
       duration: const Duration(milliseconds: 700),
     );
     _load();
+    _listenConnectivity();
   }
 
   @override
   void dispose() {
     _entranceCtrl.dispose();
+    _connectivitySub?.cancel();
     super.dispose();
   }
 
+  /// 네트워크 복구 감지 → 자동 재로드
+  void _listenConnectivity() {
+    _connectivitySub = Connectivity().onConnectivityChanged.listen((results) {
+      final online = results.any((r) => r != ConnectivityResult.none);
+      if (online && _hasNetworkError && mounted) {
+        _load();
+      }
+    });
+  }
+
   Future<void> _load() async {
-    setState(() => _isLoading = true);
+    setState(() {
+      _isLoading = true;
+      _hasNetworkError = false;
+    });
     try {
       final data = await _service.getIngredients();
       if (mounted) {
@@ -51,7 +72,17 @@ class _IngredientsScreenState extends State<IngredientsScreen>
         _entranceCtrl.forward(from: 0);
       }
     } catch (e) {
-      if (mounted) _showSnack('불러오기 실패: $e', error: true);
+      if (!mounted) return;
+      if (isAuthError(e)) {
+        // 토큰 만료 → 강제 로그아웃 → AuthGate가 LoginScreen으로 전환
+        await Supabase.instance.client.auth.signOut();
+        return;
+      }
+      setState(() => _hasNetworkError = isNetworkError(e));
+      // 기존 데이터가 있을 땐 스낵바, 없으면 에러 UI로 표시
+      if (_ingredients.isNotEmpty) {
+        _showSnack(friendlyError(e), error: true);
+      }
     } finally {
       if (mounted) setState(() => _isLoading = false);
     }
@@ -63,7 +94,7 @@ class _IngredientsScreenState extends State<IngredientsScreen>
       setState(() => _ingredients.removeWhere((i) => i.id == item.id));
       _showSnack('삭제되었습니다');
     } catch (e) {
-      _showSnack('삭제 실패: $e', error: true);
+      _showSnack(friendlyError(e), error: true);
     }
   }
 
@@ -143,6 +174,8 @@ class _IngredientsScreenState extends State<IngredientsScreen>
                         color: Color(0xFF76C442)),
                   ),
                 )
+              : (_hasNetworkError && _ingredients.isEmpty)
+                  ? SliverFillRemaining(child: _networkErrorState())
               : _mergedFiltered.isEmpty
                   ? SliverFillRemaining(child: _emptyState())
                   : SliverPadding(
@@ -382,6 +415,59 @@ class _IngredientsScreenState extends State<IngredientsScreen>
                   fontSize: 11,
                   fontWeight: FontWeight.bold)),
         ],
+      ),
+    );
+  }
+
+  Widget _networkErrorState() {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 32),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Container(
+              width: 80,
+              height: 80,
+              decoration: BoxDecoration(
+                color: const Color(0xFF252525),
+                borderRadius: BorderRadius.circular(20),
+              ),
+              child: const Icon(Icons.wifi_off_rounded,
+                  size: 40, color: Color(0xFF4A4A4A)),
+            ),
+            const SizedBox(height: 20),
+            const Text(
+              '네트워크에 연결할 수 없어요',
+              style: TextStyle(
+                  fontSize: 18,
+                  color: Colors.white,
+                  fontWeight: FontWeight.bold),
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 8),
+            const Text(
+              '네트워크 연결을 확인하고 다시 시도해주세요\n연결되면 자동으로 새로고침됩니다',
+              style: TextStyle(color: Color(0xFF6A6A6A), fontSize: 14, height: 1.5),
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 28),
+            FilledButton.icon(
+              onPressed: _load,
+              style: FilledButton.styleFrom(
+                backgroundColor: const Color(0xFF76C442),
+                foregroundColor: Colors.black,
+                padding: const EdgeInsets.symmetric(
+                    horizontal: 28, vertical: 14),
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(14)),
+              ),
+              icon: const Icon(Icons.refresh_rounded, size: 18),
+              label: const Text('다시 시도',
+                  style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+            ),
+          ],
+        ),
       ),
     );
   }

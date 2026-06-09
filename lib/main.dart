@@ -1,3 +1,4 @@
+import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
@@ -7,10 +8,22 @@ import 'config.dart';
 import 'screens/auth/login_screen.dart';
 import 'screens/home_screen.dart';
 import 'services/notification_service.dart';
+import 'utils/app_error.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await dotenv.load(fileName: '.env');
+
+  // Supabase 백그라운드 토큰 갱신 실패(오프라인) → 전역 미처리 예외를 조용히 삼킴
+  // (화면단에서는 별도로 처리됨)
+  FlutterError.onError = (details) {
+    if (isNetworkError(details.exception)) return;
+    FlutterError.presentError(details);
+  };
+  PlatformDispatcher.instance.onError = (error, _) {
+    if (isNetworkError(error)) return true;
+    return false;
+  };
 
   // 알림 서비스 초기화
   await NotificationService.initialize();
@@ -176,8 +189,28 @@ class FreshAIApp extends StatelessWidget {
   }
 }
 
-class AuthGate extends StatelessWidget {
+class AuthGate extends StatefulWidget {
   const AuthGate({super.key});
+
+  @override
+  State<AuthGate> createState() => _AuthGateState();
+}
+
+class _AuthGateState extends State<AuthGate> {
+  @override
+  void initState() {
+    super.initState();
+    // 토큰 만료 / 세션 오류 → 자동 로그인 이동
+    Supabase.instance.client.auth.onAuthStateChange.listen((state) {
+      if (!mounted) return;
+      if (state.event == AuthChangeEvent.signedOut ||
+          state.event == AuthChangeEvent.tokenRefreshed) {
+        // TokenRefreshed는 정상이므로 무시, signedOut만 처리
+        // setState를 통해 빌드가 재실행되면서 LoginScreen으로 전환됨
+        if (mounted) setState(() {});
+      }
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
