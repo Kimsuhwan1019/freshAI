@@ -189,28 +189,8 @@ class FreshAIApp extends StatelessWidget {
   }
 }
 
-class AuthGate extends StatefulWidget {
+class AuthGate extends StatelessWidget {
   const AuthGate({super.key});
-
-  @override
-  State<AuthGate> createState() => _AuthGateState();
-}
-
-class _AuthGateState extends State<AuthGate> {
-  @override
-  void initState() {
-    super.initState();
-    // 토큰 만료 / 세션 오류 → 자동 로그인 이동
-    Supabase.instance.client.auth.onAuthStateChange.listen((state) {
-      if (!mounted) return;
-      if (state.event == AuthChangeEvent.signedOut ||
-          state.event == AuthChangeEvent.tokenRefreshed) {
-        // TokenRefreshed는 정상이므로 무시, signedOut만 처리
-        // setState를 통해 빌드가 재실행되면서 LoginScreen으로 전환됨
-        if (mounted) setState(() {});
-      }
-    });
-  }
 
   @override
   Widget build(BuildContext context) {

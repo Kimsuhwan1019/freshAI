@@ -25,6 +25,7 @@ class _IngredientsScreenState extends State<IngredientsScreen>
   List<Ingredient> _ingredients = [];
   bool _isLoading = true;
   bool _hasNetworkError = false;
+  bool _isOffline = false;       // 네트워크 오류 세부 구분
   String _searchQuery = '';
   String? _selectedStorageType;
 
@@ -64,6 +65,7 @@ class _IngredientsScreenState extends State<IngredientsScreen>
     setState(() {
       _isLoading = true;
       _hasNetworkError = false;
+      _isOffline = false;
     });
     try {
       final data = await _service.getIngredients();
@@ -74,13 +76,28 @@ class _IngredientsScreenState extends State<IngredientsScreen>
     } catch (e) {
       if (!mounted) return;
       if (isAuthError(e)) {
-        // 토큰 만료 → 강제 로그아웃 → AuthGate가 LoginScreen으로 전환
         await Supabase.instance.client.auth.signOut();
         return;
       }
-      setState(() => _hasNetworkError = isNetworkError(e));
-      // 기존 데이터가 있을 땐 스낵바, 없으면 에러 UI로 표시
-      if (_ingredients.isNotEmpty) {
+      if (isNetworkError(e)) {
+        // 실제 연결 상태를 확인해 오프라인 여부를 구분
+        final results = await Connectivity().checkConnectivity();
+        if (!mounted) return;
+        final offline = results.every((r) => r == ConnectivityResult.none);
+        setState(() {
+          _hasNetworkError = true;
+          _isOffline = offline;
+        });
+        // 기존 데이터가 있으면 에러 UI 대신 스낵바로만 알림
+        if (_ingredients.isNotEmpty) {
+          _showSnack(
+            offline
+                ? '인터넷 연결을 확인해주세요'
+                : '서버에 연결할 수 없어요. 잠시 후 다시 시도해주세요',
+            error: true,
+          );
+        }
+      } else {
         _showSnack(friendlyError(e), error: true);
       }
     } finally {
@@ -420,6 +437,12 @@ class _IngredientsScreenState extends State<IngredientsScreen>
   }
 
   Widget _networkErrorState() {
+    final icon = _isOffline ? Icons.wifi_off_rounded : Icons.cloud_off_rounded;
+    final title = _isOffline ? '인터넷 연결을 확인해주세요' : '서버에 연결할 수 없어요';
+    final subtitle = _isOffline
+        ? '연결되면 자동으로 새로고침됩니다'
+        : '잠시 후 다시 시도해주세요\n연결되면 자동으로 새로고침됩니다';
+
     return Center(
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 32),
@@ -433,22 +456,22 @@ class _IngredientsScreenState extends State<IngredientsScreen>
                 color: const Color(0xFF252525),
                 borderRadius: BorderRadius.circular(20),
               ),
-              child: const Icon(Icons.wifi_off_rounded,
-                  size: 40, color: Color(0xFF4A4A4A)),
+              child: Icon(icon, size: 40, color: const Color(0xFF4A4A4A)),
             ),
             const SizedBox(height: 20),
-            const Text(
-              '네트워크에 연결할 수 없어요',
-              style: TextStyle(
+            Text(
+              title,
+              style: const TextStyle(
                   fontSize: 18,
                   color: Colors.white,
                   fontWeight: FontWeight.bold),
               textAlign: TextAlign.center,
             ),
             const SizedBox(height: 8),
-            const Text(
-              '네트워크 연결을 확인하고 다시 시도해주세요\n연결되면 자동으로 새로고침됩니다',
-              style: TextStyle(color: Color(0xFF6A6A6A), fontSize: 14, height: 1.5),
+            Text(
+              subtitle,
+              style: const TextStyle(
+                  color: Color(0xFF6A6A6A), fontSize: 14, height: 1.5),
               textAlign: TextAlign.center,
             ),
             const SizedBox(height: 28),
