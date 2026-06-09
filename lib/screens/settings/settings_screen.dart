@@ -69,32 +69,29 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   Future<void> _testNotification() async {
-    final client = Supabase.instance.client;
-    final userId = client.auth.currentUser?.id;
-    if (userId == null) return;
+    if (Supabase.instance.client.auth.currentUser == null) return;
 
     setState(() => _notifLoading = true);
     try {
-      // 실제 유통기한 임박 식재료 조회
       final ingredients = await IngredientService().getIngredients();
-      final alertItems = ingredients.where((i) {
-        final days = ExpiryUtils.daysUntil(i.expiryDate);
-        return days != null && days <= 3;
-      }).toList();
 
-      String body;
-      if (alertItems.isEmpty) {
-        body = '유통기한 임박 식재료가 없습니다. 안심하세요! 😊';
-      } else {
-        final parts = alertItems.map((i) {
-          final days = ExpiryUtils.daysUntil(i.expiryDate)!;
-          return '${i.name}(${days <= 0 ? '만료' : 'D-$days'})';
-        }).join(', ');
-        body = '$parts 유통기한이 곧 만료됩니다!';
+      // 유통기한 3일 이내 + 만료된 식재료 → 공용 ExpiryNotifItem 목록 생성
+      final items = ingredients
+          .where((i) {
+            final days = ExpiryUtils.daysUntil(i.expiryDate);
+            return days != null && days <= 3;
+          })
+          .map((i) => ExpiryNotifItem(
+                name: i.name,
+                days: ExpiryUtils.daysUntil(i.expiryDate)!,
+              ))
+          .toList();
+
+      // 공용 함수로 알림 표시 (정렬 · BigTextStyle · HTML 포맷 모두 적용)
+      final shown = await NotificationService.showExpiryNotif(items);
+      if (mounted) {
+        _showSnack(shown ? '테스트 알림을 전송했습니다' : '유통기한 임박 식재료가 없습니다 😊');
       }
-
-      await NotificationService.showPreview(body);
-      if (mounted) _showSnack('테스트 알림을 전송했습니다');
     } catch (e) {
       if (mounted) _showSnack('알림 전송 실패: $e', error: true);
     } finally {

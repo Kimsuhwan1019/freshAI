@@ -13,7 +13,18 @@ const _kNotifEnabled = 'notifications_enabled';
 const _kChannelId = 'freshAI_expiry';
 const _kChannelName = '유통기한 알림';
 
-/// WorkManager 백그라운드 진입점 — top-level + vm:entry-point 필수
+// ── 공용 데이터 클래스 ─────────────────────────────────────────────────────────
+
+/// 알림에 사용할 식재료 항목 (배경 태스크 · 설정 탭 공유)
+class ExpiryNotifItem {
+  final String name;
+  final int days; // ≤ 0 = 이미 만료, > 0 = 남은 일수
+
+  const ExpiryNotifItem({required this.name, required this.days});
+}
+
+// ── WorkManager 백그라운드 진입점 ──────────────────────────────────────────────
+
 @pragma('vm:entry-point')
 void callbackDispatcher() {
   Workmanager().executeTask((taskName, _) async {
@@ -39,7 +50,6 @@ void callbackDispatcher() {
       final userId = Supabase.instance.client.auth.currentUser?.id;
       if (userId == null) return true;
 
-      // 오늘 기준 3일 이내 + 이미 만료된 식재료 조회
       final cutoff = DateFormat('yyyy-MM-dd')
           .format(DateTime.now().add(const Duration(days: 3)));
 
@@ -50,46 +60,31 @@ void callbackDispatcher() {
           .not('expiry_date', 'is', null)
           .lte('expiry_date', cutoff);
 
-      final rows = (data as List).cast<Map<String, dynamic>>();
-      if (rows.isEmpty) return true;
-
-      final parts = <String>[];
-      for (final row in rows) {
-        final name = row['name'] as String;
+      final items = <ExpiryNotifItem>[];
+      for (final row in (data as List).cast<Map<String, dynamic>>()) {
         final expiry = DateTime.parse(row['expiry_date'] as String);
         final days = ExpiryUtils.daysUntil(expiry);
         if (days == null) continue;
-        parts.add('$name(${days <= 0 ? '만료' : 'D-$days'})');
+        items.add(ExpiryNotifItem(name: row['name'] as String, days: days));
       }
-      if (parts.isEmpty) return true;
 
+      if (items.isEmpty) return true;
+
+      // 배경 태스크용 플러그인 인스턴스 초기화 후 공용 함수 호출
       final plugin = FlutterLocalNotificationsPlugin();
       await plugin.initialize(
         settings: const InitializationSettings(
           android: AndroidInitializationSettings('@mipmap/ic_launcher'),
         ),
       );
-      await plugin.show(
-        id: 0,
-        title: '🧊 FreshAI 유통기한 알림',
-        body: '${parts.join(', ')} 유통기한이 곧 만료됩니다!',
-        notificationDetails: const NotificationDetails(
-          android: AndroidNotificationDetails(
-            _kChannelId,
-            _kChannelName,
-            importance: Importance.high,
-            priority: Priority.high,
-            icon: '@mipmap/ic_launcher',
-          ),
-        ),
-      );
+      await NotificationService.showExpiryNotif(items, pluginOverride: plugin);
     } catch (_) {}
 
     return true;
   });
 }
 
-// ── App-side notification service ─────────────────────────────────────────────
+// ── NotificationService ────────────────────────────────────────────────────────
 
 class NotificationService {
   NotificationService._();
@@ -103,7 +98,6 @@ class NotificationService {
         android: AndroidInitializationSettings('@mipmap/ic_launcher'),
       ),
     );
-    // Android 8+ 알림 채널 생성
     await _plugin
         .resolvePlatformSpecificImplementation<
             AndroidFlutterLocalNotificationsPlugin>()
@@ -124,13 +118,11 @@ class NotificationService {
     return await impl?.requestNotificationsPermission() ?? false;
   }
 
-  /// 알림 활성화 여부 조회
   static Future<bool> isEnabled() async {
     final prefs = await SharedPreferences.getInstance();
     return prefs.getBool(_kNotifEnabled) ?? true;
   }
 
-  /// 알림 ON/OFF 설정
   static Future<void> setEnabled(bool value) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(_kNotifEnabled, value);
@@ -141,7 +133,6 @@ class NotificationService {
     }
   }
 
-  /// 앱 시작 시 스케줄 등록
   static Future<void> ensureScheduled() async {
     if (await isEnabled()) await _scheduleDaily();
   }
@@ -157,7 +148,6 @@ class NotificationService {
     );
   }
 
-  /// 다음 오전 9시까지 남은 시간
   static Duration _delayUntilNextNineAM() {
     final now = DateTime.now();
     var target = DateTime(now.year, now.month, now.day, 9);
@@ -165,21 +155,83 @@ class NotificationService {
     return target.difference(now);
   }
 
-  /// 설정 화면 테스트용 즉시 알림
-  static Future<void> showPreview(String body) async {
-    await _plugin.show(
+  // ── 공용 알림 표시 함수 ────────────────────────────────────────────────────
+
+  /// 만료·임박 식재료 알림을 BigTextStyle 형식으로 표시.
+  /// items가 비어있으면 알림 미표시 후 false 반환.
+  /// [pluginOverride]: 백그라운드 태스크처럼 별도 인스턴스가 필요할 때 전달.
+  static Future<bool> showExpiryNotif(
+    List<ExpiryNotifItem> items, {
+    FlutterLocalNotificationsPlugin? pluginOverride,
+  }) async {
+    final payload = _buildPayload(items);
+    if (payload == null) return false;
+
+    final plugin = pluginOverride ?? _plugin;
+    await plugin.show(
       id: 0,
-      title: '🧊 FreshAI 유통기한 알림',
-      body: body,
-      notificationDetails: const NotificationDetails(
+      title: payload.title,
+      body: payload.summary,
+      notificationDetails: NotificationDetails(
         android: AndroidNotificationDetails(
           _kChannelId,
           _kChannelName,
           importance: Importance.high,
           priority: Priority.high,
           icon: '@mipmap/ic_launcher',
+          styleInformation: BigTextStyleInformation(
+            payload.bigText,
+            htmlFormatBigText: true,
+          ),
         ),
       ),
     );
+    return true;
+  }
+
+  // ── 페이로드 빌더 (정렬 · 그룹핑 · HTML) ──────────────────────────────────
+
+  static ({String title, String summary, String bigText})? _buildPayload(
+    List<ExpiryNotifItem> items,
+  ) {
+    // 만료된 항목: 많이 지난 순 (days 오름차순: -5 → -3 → -1 → 0)
+    final expired = items.where((i) => i.days <= 0).toList()
+      ..sort((a, b) => a.days.compareTo(b.days));
+
+    // 임박한 항목: D-1, D-2, D-3 순 (days 오름차순)
+    final upcoming = items.where((i) => i.days > 0).toList()
+      ..sort((a, b) => a.days.compareTo(b.days));
+
+    if (expired.isEmpty && upcoming.isEmpty) return null;
+
+    final total = expired.length + upcoming.length;
+
+    // 제목 (접힌 상태에서도 표시)
+    final title = '🧊 유통기한 알림 · 총 $total개';
+
+    // 한 줄 요약 (접혔을 때 body)
+    final firstName = expired.isNotEmpty ? expired.first.name : upcoming.first.name;
+    final rest = total - 1;
+    final summary = rest > 0
+        ? '$firstName 외 $rest개가 곧 만료돼요'
+        : '$firstName 유통기한이 곧 만료돼요';
+
+    // BigText HTML (펼쳤을 때)
+    final buf = StringBuffer();
+    if (expired.isNotEmpty) {
+      buf.write('<b>🔴 이미 만료됨</b>');
+      for (final item in expired) {
+        buf.write('<br>• ${item.name}');
+      }
+    }
+    if (upcoming.isNotEmpty) {
+      if (expired.isNotEmpty) buf.write('<br>');
+      buf.write('<b>🟠 유통기한 임박</b>');
+      for (final item in upcoming) {
+        buf.write('<br>• ${item.name} (D-${item.days})');
+      }
+    }
+
+    return (title: title, summary: summary, bigText: buf.toString());
   }
 }
