@@ -1,0 +1,30 @@
+name: Supabase Keep-Alive
+
+on:
+  schedule:
+    # 매 2일마다 오전 9시 UTC 실행 (한국시간 오후 6시)
+    - cron: '0 9 */2 * *'
+  workflow_dispatch: # 수동 실행
+
+jobs:
+  ping:
+    name: Ping Supabase REST API
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Ping keep_alive table
+        run: |
+          HTTP_STATUS=$(curl -s -o /tmp/resp.json -w "%{http_code}" \
+            "https://tsqhjwsruyohtnzonvvn.supabase.co/rest/v1/keep_alive?select=id&limit=1" \
+            -H "apikey: ${{ secrets.SUPABASE_ANON_KEY }}" \
+            -H "Authorization: Bearer ${{ secrets.SUPABASE_ANON_KEY }}")
+
+          echo "HTTP Status : $HTTP_STATUS"
+          echo "Response    : $(cat /tmp/resp.json)"
+
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "::error::Supabase keep-alive ping failed (HTTP $HTTP_STATUS)"
+            exit 1
+          fi
+
+          echo "✅ Supabase keep-alive ping successful"

@@ -1,17 +1,16 @@
-# fresh_ai
+# FreshAI
 
-A new Flutter project.
+스마트 냉장고 식재료 관리 앱 (Flutter · Supabase · GPT-4o)
 
-## Getting Started
+## GitHub Secrets 등록
 
-This project is a starting point for a Flutter application.
+**GitHub 시크릿 등록**: 저장소 → Settings → Secrets and variables → Actions → New repository secret → `SUPABASE_ANON_KEY` 에 Supabase 프로젝트의 anon public key 값 입력.
 
-A few resources to get you started if this is your first Flutter project:
+## Supabase Keep-Alive 설정
 
-- [Learn Flutter](https://docs.flutter.dev/get-started/learn-flutter)
-- [Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Flutter learning resources](https://docs.flutter.dev/reference/learning-resources)
+무료 플랜 7일 자동 일시정지 방지용 테이블 초기 설정:
 
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+1. [Supabase 대시보드](https://app.supabase.com) → SQL Editor
+2. `supabase/keep_alive.sql` 내용 실행
+
+이후 GitHub Actions가 2일마다 자동으로 ping을 보냅니다.
