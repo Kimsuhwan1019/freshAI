@@ -1,7 +1,10 @@
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
-import '../../services/recipe_service.dart';
 import '../../services/animation_settings.dart';
+import '../../services/ingredient_service.dart';
+import '../../services/notification_service.dart';
+import '../../services/recipe_service.dart';
+import '../../utils/expiry_utils.dart';
 
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
@@ -12,6 +15,8 @@ class SettingsScreen extends StatefulWidget {
 
 class _SettingsScreenState extends State<SettingsScreen> {
   bool _animEnabled = true;
+  bool _notifEnabled = true;
+  bool _notifLoading = false;
 
   @override
   void initState() {
@@ -20,6 +25,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       if (mounted) setState(() => _animEnabled = AnimationSettings().isEnabled);
     });
     AnimationSettings().enabled.addListener(_onAnimChanged);
+    _loadNotifState();
   }
 
   @override
@@ -30,6 +36,81 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   void _onAnimChanged() {
     if (mounted) setState(() => _animEnabled = AnimationSettings().isEnabled);
+  }
+
+  Future<void> _loadNotifState() async {
+    final enabled = await NotificationService.isEnabled();
+    if (mounted) setState(() => _notifEnabled = enabled);
+  }
+
+  Future<void> _toggleNotification(bool value) async {
+    if (_notifLoading) return;
+    setState(() => _notifLoading = true);
+
+    try {
+      if (value) {
+        // 권한 요청
+        final granted = await NotificationService.requestPermission();
+        if (!granted && mounted) {
+          _showSnack('알림 권한이 필요합니다. 설정에서 허용해주세요.', error: true);
+          setState(() => _notifLoading = false);
+          return;
+        }
+      }
+      await NotificationService.setEnabled(value);
+      if (mounted) setState(() => _notifEnabled = value);
+
+      if (value && mounted) {
+        _showSnack('매일 오전 9시에 유통기한 알림을 드립니다');
+      }
+    } finally {
+      if (mounted) setState(() => _notifLoading = false);
+    }
+  }
+
+  Future<void> _testNotification() async {
+    final client = Supabase.instance.client;
+    final userId = client.auth.currentUser?.id;
+    if (userId == null) return;
+
+    setState(() => _notifLoading = true);
+    try {
+      // 실제 유통기한 임박 식재료 조회
+      final ingredients = await IngredientService().getIngredients();
+      final alertItems = ingredients.where((i) {
+        final days = ExpiryUtils.daysUntil(i.expiryDate);
+        return days != null && days <= 3;
+      }).toList();
+
+      String body;
+      if (alertItems.isEmpty) {
+        body = '유통기한 임박 식재료가 없습니다. 안심하세요! 😊';
+      } else {
+        final parts = alertItems.map((i) {
+          final days = ExpiryUtils.daysUntil(i.expiryDate)!;
+          return '${i.name}(${days <= 0 ? '만료' : 'D-$days'})';
+        }).join(', ');
+        body = '$parts 유통기한이 곧 만료됩니다!';
+      }
+
+      await NotificationService.showPreview(body);
+      if (mounted) _showSnack('테스트 알림을 전송했습니다');
+    } catch (e) {
+      if (mounted) _showSnack('알림 전송 실패: $e', error: true);
+    } finally {
+      if (mounted) setState(() => _notifLoading = false);
+    }
+  }
+
+  void _showSnack(String msg, {bool error = false}) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(msg),
+        backgroundColor:
+            error ? const Color(0xFFFF453A) : const Color(0xFF76C442),
+      ),
+    );
   }
 
   Future<void> _signOut() async {
@@ -74,6 +155,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
         padding: const EdgeInsets.all(16),
         children: [
           _profileCard(email, initial),
+          const SizedBox(height: 24),
+          _sectionLabel('알림'),
+          const SizedBox(height: 8),
+          _notifCard(),
           const SizedBox(height: 24),
           _sectionLabel('화면'),
           const SizedBox(height: 8),
@@ -164,6 +249,98 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
+  // ── 알림 카드 ──────────────────────────────────────────────────
+
+  Widget _notifCard() {
+    return Container(
+      decoration: BoxDecoration(
+        color: const Color(0xFF1A1A1A),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: const Color(0xFF2A2A2A)),
+      ),
+      child: Column(
+        children: [
+          // 토글 행
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 14, 12, 14),
+            child: Row(
+              children: [
+                Container(
+                  width: 30,
+                  height: 30,
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFFF9F0A).withValues(alpha: 0.12),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: const Icon(Icons.notifications_rounded,
+                      size: 16, color: Color(0xFFFF9F0A)),
+                ),
+                const SizedBox(width: 12),
+                const Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text('유통기한 알림',
+                          style: TextStyle(
+                              fontWeight: FontWeight.w600, fontSize: 14)),
+                      Text('매일 오전 9시, 3일 이내 만료 식재료 알림',
+                          style: TextStyle(
+                              color: Color(0xFF6A6A6A), fontSize: 12)),
+                    ],
+                  ),
+                ),
+                if (_notifLoading)
+                  const SizedBox(
+                    width: 24,
+                    height: 24,
+                    child: CircularProgressIndicator(
+                        strokeWidth: 2, color: Color(0xFF76C442)),
+                  )
+                else
+                  Switch(
+                    value: _notifEnabled,
+                    onChanged: _toggleNotification,
+                    activeThumbColor: const Color(0xFFFF9F0A),
+                    activeTrackColor:
+                        const Color(0xFFFF9F0A).withValues(alpha: 0.4),
+                  ),
+              ],
+            ),
+          ),
+          // 테스트 알림 버튼 (알림 ON일 때만 표시)
+          if (_notifEnabled) ...[
+            const Divider(height: 1, color: Color(0xFF252525), indent: 16),
+            InkWell(
+              onTap: _notifLoading ? null : _testNotification,
+              borderRadius:
+                  const BorderRadius.vertical(bottom: Radius.circular(17)),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(
+                    horizontal: 16, vertical: 12),
+                child: Row(
+                  children: [
+                    const Icon(Icons.send_rounded,
+                        size: 15, color: Color(0xFF9A9A9A)),
+                    const SizedBox(width: 10),
+                    const Expanded(
+                      child: Text(
+                        '테스트 알림 보내기',
+                        style: TextStyle(
+                            fontSize: 13, color: Color(0xFF9A9A9A)),
+                      ),
+                    ),
+                    const Icon(Icons.chevron_right_rounded,
+                        size: 16, color: Color(0xFF4A4A4A)),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
   Widget _animCard() {
     return Container(
       decoration: BoxDecoration(
@@ -203,7 +380,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
               value: _animEnabled,
               onChanged: (v) => AnimationSettings().setEnabled(v),
               activeThumbColor: const Color(0xFF76C442),
-              activeTrackColor: const Color(0xFF76C442).withValues(alpha: 0.4),
+              activeTrackColor:
+                  const Color(0xFF76C442).withValues(alpha: 0.4),
             ),
           ],
         ),

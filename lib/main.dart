@@ -2,13 +2,22 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
+import 'package:workmanager/workmanager.dart';
 import 'config.dart';
 import 'screens/auth/login_screen.dart';
 import 'screens/home_screen.dart';
+import 'services/notification_service.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await dotenv.load(fileName: '.env');
+
+  // 알림 서비스 초기화
+  await NotificationService.initialize();
+
+  // WorkManager 초기화 (백그라운드 유통기한 체크)
+  await Workmanager().initialize(callbackDispatcher);
+  await NotificationService.ensureScheduled();
 
   SystemChrome.setSystemUIOverlayStyle(
     const SystemUiOverlayStyle(
