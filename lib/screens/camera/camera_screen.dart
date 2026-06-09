@@ -1,6 +1,5 @@
 import 'dart:io';
 import 'dart:math' as math;
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:intl/intl.dart';
@@ -1096,7 +1095,7 @@ class _SparkleOverlayState extends State<_SparkleOverlay>
                 ),
                 AnimatedBuilder(
                   animation: _pulseCtrl,
-                  builder: (_, __) => Text(
+                  builder: (_, _) => Text(
                     '✨',
                     style: TextStyle(fontSize: 22 + _pulseCtrl.value * 6),
                   ),

@@ -109,10 +109,11 @@ class _IngredientFormScreenState extends State<IngredientFormScreen> {
     if (!_formKey.currentState!.validate()) return;
     setState(() => _isLoading = true);
     try {
+      final parsedQty = double.tryParse(_qtyCtrl.text);
       final data = <String, dynamic>{
         'name': _nameCtrl.text.trim(),
-        if (_qtyCtrl.text.isNotEmpty)
-          'quantity': double.tryParse(_qtyCtrl.text),
+        if (_qtyCtrl.text.isNotEmpty && parsedQty != null)
+          'quantity': parsedQty,
         if (_unitCtrl.text.isNotEmpty)
           'unit': _unitCtrl.text.trim(),
         if (_category != null) 'category': _category,
@@ -244,7 +245,7 @@ class _IngredientFormScreenState extends State<IngredientFormScreen> {
                     child: ListView.separated(
                       shrinkWrap: true,
                       itemCount: _nameSuggestions.length,
-                      separatorBuilder: (_, __) =>
+                      separatorBuilder: (_, _) =>
                           const Divider(height: 1, color: Color(0xFF2A2A2A)),
                       itemBuilder: (ctx, i) {
                         final s = _nameSuggestions[i];

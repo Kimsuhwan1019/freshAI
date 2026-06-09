@@ -102,6 +102,8 @@ class _RecipeScreenState extends State<RecipeScreen> {
               .toSet();
         });
       }
+    } catch (e) {
+      if (mounted) _showSnack('식재료 불러오기 실패: $e', error: true);
     } finally {
       if (mounted) setState(() => _isFetching = false);
     }
@@ -242,14 +244,6 @@ class _RecipeScreenState extends State<RecipeScreen> {
   }
 
   // ── Selection ──────────────────────────────────────────────
-
-  void _toggleIngredient(String id) => setState(() {
-        if (_selectedIds.contains(id)) {
-          _selectedIds.remove(id);
-        } else {
-          _selectedIds.add(id);
-        }
-      });
 
   void _selectAll() =>
       setState(() => _selectedIds = _ingredients.map((i) => i.id).toSet());
@@ -1050,7 +1044,7 @@ class _RecipeScreenState extends State<RecipeScreen> {
           ),
           const SizedBox(width: 8),
           GestureDetector(
-            onTap: selected.isEmpty ? null : _getRecipes,
+            onTap: (selected.isEmpty || _isLoading) ? null : _getRecipes,
             child: Container(
               padding: const EdgeInsets.symmetric(
                   horizontal: 10, vertical: 5),
@@ -2314,8 +2308,16 @@ class _CookingCompleteDialogState extends State<_CookingCompleteDialog> {
     try {
       await widget.onConfirm(widget.entries);
       if (mounted) Navigator.pop(context);
-    } catch (_) {
-      if (mounted) setState(() => _loading = false);
+    } catch (e) {
+      if (mounted) {
+        setState(() => _loading = false);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('저장 실패: $e'),
+            backgroundColor: const Color(0xFFFF453A),
+          ),
+        );
+      }
     }
   }
 

@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io';
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
@@ -328,6 +329,12 @@ class _ShoppingScreenState extends State<ShoppingScreen>
         } else {
           _cvs = results;
         }
+        _loadingStores = false;
+      });
+    } on SocketException {
+      if (!mounted) return;
+      setState(() {
+        _storeError = '인터넷 연결을 확인해주세요';
         _loadingStores = false;
       });
     } catch (e) {
@@ -1256,7 +1263,7 @@ class _ConfettiBannerState extends State<_ConfettiBanner>
                 borderRadius: BorderRadius.circular(14),
                 child: AnimatedBuilder(
                   animation: _ctrl,
-                  builder: (_, __) => CustomPaint(
+                  builder: (_, _) => CustomPaint(
                     painter: _ConfettiPainter(_ctrl.value),
                   ),
                 ),
